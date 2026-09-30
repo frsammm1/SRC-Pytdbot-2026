@@ -1,0 +1,13 @@
+pytdbot[tdjson]>=0.10.1
+tgcrypto
+aiohttp
+python-dotenv
+uvloop
+motor
+pymongo
+psutil
+requests
+qrcode
+Pillow
+python-telegram-bot[http2]
+httpx

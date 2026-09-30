@@ -1,0 +1,1290 @@
+"""
+transfer.py  –  Main transfer engine  (v7.0 — TDLib / pytdbot)
+
+Behaviour is 1:1 with the Pyrofork v6.2 engine:
+  • All sources (public + private) go through download → upload, so custom
+    thumbnails, caption/filename manipulations and logging behave the same
+    everywhere.
+  • Videos re-upload as STREAMABLE videos (supports_streaming=True), audio as
+    playable audio (duration preserved), images as viewable photos.
+  • Files < 45 MB go out via PTB (HTTP Bot API); bigger ones via the TDLib
+    bot client. > 2 GiB files are split into 2 GiB parts.
+  • Real-time checkpointing + commit-pointer semantics unchanged — a failed
+    message is NEVER skipped; the run stops and auto-resume retries it.
+
+TDLIB MAPPING NOTES:
+  • pyrogram get_messages(ids=batch) → client.getMessages(chat_id, ids)
+    (TDLib returns a Messages object; deleted entries come back as null).
+  • FloodWait exception → types.Error(code=429) → FloodWaitError(x) raised
+    here so the exact same backoff logic applies.
+  • download_media(msg, file_name=…) → message.download(synchronous=True)
+    then move TDLib's cached file onto the requested path (so the re-upload
+    carries the manipulated filename).
+  • send_video/send_document blocking calls → sendVideo/sendDocument (which
+    return a PENDING message immediately) + awaiting the
+    updateMessageSendSucceeded bridge (progress.register_pending_send).
+  • message_thread_id=dest_topic_id → topic_id=MessageTopicForum(...).
+"""
+
+import asyncio
+import math
+import os
+import shutil
+import time
+
+import config
+from utils import (
+    human_readable_size, time_formatter,
+    get_target_info, get_media_file_size, get_video_metadata,
+    apply_filename_manipulations, apply_caption_manipulations,
+    sanitize_filename, is_special_media, is_service_message,
+    message_plain_text, message_html_text, _media_file, _cname,
+)
+from progress import (
+    TransferProgress, watch_file, unwatch_file,
+    register_pending_send, cancel_pending_send,
+)
+from keyboards import get_progress_keyboard
+from session_manager import session_manager, FloodWaitError
+import database as db
+
+
+# ── CONSTANTS ─────────────────────────────────────────────────────────────────
+
+SPLIT_THRESHOLD     = config.SPLIT_FILE_THRESHOLD   # exactly 2 GiB
+GET_MESSAGES_BATCH  = 200    # same batch size as the Pyrogram version
+
+
+# ── SMALL HELPERS ─────────────────────────────────────────────────────────────
+
+def _ram_bar(ram_used: int, ram_total: int) -> str:
+    if not ram_total:
+        return ""
+    pct      = ram_used / ram_total * 100
+    used_mb  = ram_used  / (1024 * 1024)
+    total_mb = ram_total / (1024 * 1024)
+    filled   = min(10, int(pct / 10))
+    bar      = "█" * filled + "░" * (10 - filled)
+    status   = "✅ Safe" if pct < 60 else ("⚠️ High" if pct < 80 else "🔴 Critical")
+    return (
+        f"🧠 RAM: **{bar} {pct:.1f}%**\n"
+        f"      `{used_mb:.0f}MB / {total_mb:.0f}MB` {status}\n"
+    )
+
+
+async def safe_edit_message(message, text: str, reply_markup=None):
+    """Fire-and-forget message edit. Never raises."""
+    async def _edit():
+        try:
+            if reply_markup is not None:
+                await message.edit_text(text, reply_markup=reply_markup, parse_mode="markdown")
+            else:
+                await message.edit_text(text, parse_mode="markdown")
+        except Exception:
+            pass
+    asyncio.create_task(_edit())
+
+
+def _is_in_topic(msg, topic_id: int) -> bool:
+    """Return True if a TDLib message belongs to the given forum topic."""
+    if msg.id == topic_id:
+        return True
+    t = getattr(msg, 'topic_id', None)
+    if _cname(t) == 'MessageTopicForum' and getattr(t, 'forum_topic_id', None) == topic_id:
+        return True
+    return False
+
+
+def _topic_kw(dest_topic_id):
+    """pytdbot topic kwarg for send helpers."""
+    if not dest_topic_id:
+        return {}
+    from pytdbot import types
+    return {'topic_id': types.MessageTopicForum(forum_topic_id=int(dest_topic_id))}
+
+
+def _raise_if_error(res, context: str = ""):
+    """Convert a TDLib Error into the legacy exception vocabulary."""
+    if not config.is_error(res):
+        return
+    retry = config.get_retry_after(res)
+    if retry:
+        raise FloodWaitError(retry)
+    msg = (getattr(res, 'message', '') or '')
+    up  = msg.upper()
+    if 'CHAT_ADMIN_REQUIRED' in up or 'ADMINISTRATOR' in up and 'RIGHT' in up:
+        raise PermissionError(
+            "❌ **Bot lacks permission in destination channel.**\n"
+            "Ensure the bot is **Full Admin** there.\n`CHAT_ADMIN_REQUIRED`"
+        )
+    if 'CHAT_WRITE_FORBIDDEN' in up or "NOT ENOUGH RIGHTS" in up or 'NOT_A_MEMBER' in up:
+        raise PermissionError(
+            f"❌ **Bot cannot post in destination channel.**\n`{msg}`"
+        )
+    if config.is_auth_error(res):
+        from session_manager import SessionExpiredError
+        raise SessionExpiredError(msg)
+    raise Exception(f"TDLib error {getattr(res, 'code', '')}: {msg} {context}".strip())
+
+
+# ── CHAT RESOLUTION ───────────────────────────────────────────────────────────
+
+async def _resolve_chat_id(client, source) -> int:
+    """
+    Resolve a source identifier (numeric -100… id or public @username) to a
+    TDLib chat_id. Pyrogram's get_chat() accepted both; TDLib needs
+    searchPublicChat for usernames.
+    """
+    if isinstance(source, int) or (isinstance(source, str) and source.lstrip('-').isdigit()):
+        chat = await client.getChat(chat_id=int(source))
+        _raise_if_error(chat, f"(resolve {source})")
+        return int(source)
+    username = str(source).lstrip('@')
+    chat = await client.searchPublicChat(username=username)
+    _raise_if_error(chat, f"(resolve @{username})")
+    return chat.id
+
+
+# ── PREFLIGHT CHECK ───────────────────────────────────────────────────────────
+
+async def _preflight_check(bot_client, dest_id) -> tuple:
+    """Resolve the destination chat via TDLib. Returns (ok, error_message)."""
+    try:
+        chat = await bot_client.getChat(chat_id=dest_id)
+        _raise_if_error(chat)
+        config.logger.info(f"✅ Preflight OK: dest peer resolved ({dest_id})")
+        return True, None
+    except FloodWaitError as e:
+        config.logger.warning(f"Preflight FloodWait {e.x}s — waiting…")
+        await asyncio.sleep(e.x + 2)
+        return True, None
+    except PermissionError as e:
+        return False, str(e)
+    except Exception as e:
+        config.logger.warning(f"Preflight warning (non-fatal): {type(e).__name__}: {e}")
+        return True, None
+
+
+# ── ROBUST MESSAGE ITERATION (TDLib getMessages) ──────────────────────────────
+
+async def robust_iter_messages(user_client, source_id, start_msg: int,
+                                end_msg: int, topic_id=None):
+    """
+    Async generator — yields pytdbot Messages from [start_msg, end_msg].
+    Uses getMessages(chat_id, ids=[list]) in batches of 200 IDs.
+    Topic-filtered client-side via _is_in_topic().
+    """
+    source_id = await _resolve_chat_id(user_client, source_id)
+
+    current     = start_msg
+    zero_misses = 0
+    MAX_CONN_RETRIES = 5
+    conn_retries     = 0
+
+    while current <= end_msg:
+        batch_end = min(current + GET_MESSAGES_BATCH - 1, end_msg)
+        ids       = list(range(current, batch_end + 1))
+
+        try:
+            res = await user_client.getMessages(chat_id=source_id, message_ids=ids)
+            if config.is_error(res):
+                _raise_if_error(res, "(getMessages)")
+            conn_retries = 0
+        except FloodWaitError as e:
+            wait = e.x + 2
+            config.logger.warning(f"FloodWait {e.x}s during source scan — waiting {wait}s")
+            await asyncio.sleep(wait)
+            continue
+        except Exception as e:
+            from session_manager import SessionExpiredError
+            if isinstance(e, SessionExpiredError):
+                raise Exception(
+                    "⚠️ User session expired during transfer.\n"
+                    "Please use /login to reconnect and try again."
+                )
+            msg = str(e)
+            if 'CHAT_NOT_FOUND' in msg.upper() or 'PEER' in msg.upper():
+                conn_retries += 1
+                config.logger.warning(
+                    f"Chat not found for source {source_id} (attempt {conn_retries}) — re-resolving…"
+                )
+                if conn_retries > MAX_CONN_RETRIES:
+                    raise Exception(
+                        f"Could not resolve source chat {source_id} after "
+                        f"{MAX_CONN_RETRIES} attempts: {e}"
+                    )
+                try:
+                    await user_client.getChat(chat_id=source_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(3 * conn_retries)
+                continue
+            conn_retries += 1
+            config.logger.error(f"getMessages error (attempt {conn_retries}): {e}")
+            if conn_retries > MAX_CONN_RETRIES:
+                raise Exception(f"Too many errors fetching messages: {e}")
+            await asyncio.sleep(5 * conn_retries)
+            continue
+
+        # ── Filter and yield valid messages ────────────────────────────────
+        valid_in_batch = 0
+        raw_msgs       = (getattr(res, 'messages', None) or [])
+        sorted_msgs    = sorted([m for m in raw_msgs if m], key=lambda m: m.id)
+
+        for msg in sorted_msgs:
+            if msg.id < start_msg or msg.id > end_msg:
+                continue
+            if topic_id is not None and not _is_in_topic(msg, topic_id):
+                continue
+            valid_in_batch += 1
+            zero_misses     = 0
+            yield msg
+
+        # ── Zero-progress protection ───────────────────────────────────────
+        if valid_in_batch == 0:
+            zero_misses += 1
+            if zero_misses >= config.ZERO_PROGRESS_RETRIES:
+                config.logger.warning(
+                    f"iter: {config.ZERO_PROGRESS_RETRIES} consecutive empty batches "
+                    f"at msg {current}. Concluding done."
+                )
+                return
+            delay = config.ZERO_PROGRESS_DELAYS[
+                min(zero_misses - 1, len(config.ZERO_PROGRESS_DELAYS) - 1)
+            ]
+            config.logger.warning(
+                f"iter: empty batch at {current}–{batch_end} "
+                f"(retry {zero_misses}/{config.ZERO_PROGRESS_RETRIES} in {delay}s…)"
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        current = batch_end + 1
+        await asyncio.sleep(1)
+
+
+# ── TDLIB DOWNLOAD HELPER ─────────────────────────────────────────────────────
+
+async def td_download(client, message, dest_path: str, tracker=None) -> str:
+    """
+    Download a message's media via TDLib and place it at dest_path.
+    Returns dest_path. Raises on failure (Error, timeout, missing file).
+    """
+    from pytdbot import types
+
+    media_file = _media_file(message)
+    file_id    = getattr(media_file, 'id', None)
+    if tracker and file_id is not None:
+        watch_file(file_id, tracker, 'download')
+    try:
+        local = await message.download(priority=32, synchronous=True)
+        _raise_if_error(local, "(downloadFile)")
+        src_path = getattr(local, 'path', None)
+        if not src_path or not os.path.exists(src_path):
+            raise RuntimeError("downloadFile returned no local path")
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        if os.path.abspath(src_path) != os.path.abspath(dest_path):
+            shutil.copyfile(src_path, dest_path)
+        return dest_path
+    finally:
+        if tracker and file_id is not None:
+            unwatch_file(file_id, tracker)
+
+
+async def td_download_remote_id(client, remote_file_id: str, dest_path: str) -> str:
+    """Download any file by its TDLib remote file id (thumbnails etc.)."""
+    f = await client.getRemoteFile(remote_file_id=remote_file_id)
+    _raise_if_error(f, "(getRemoteFile)")
+    res = await client.downloadFile(
+        file_id=f.id, priority=32, offset=0, limit=0, synchronous=True
+    )
+    _raise_if_error(res, "(downloadFile)")
+    src_path = getattr(getattr(res, 'local', None), 'path', None)
+    if not src_path or not os.path.exists(src_path):
+        raise RuntimeError("thumbnail download produced no file")
+    if os.path.abspath(src_path) != os.path.abspath(dest_path):
+        shutil.copyfile(src_path, dest_path)
+    return dest_path
+
+
+# ── LOG TRANSFER ──────────────────────────────────────────────────────────────
+
+async def log_transfer(bot_client, log_channel, sent_message,
+                        session_id, dest_id, file_name, part_num=None):
+    if not log_channel or not sent_message or isinstance(sent_message, bool):
+        return
+    try:
+        res = await bot_client.forwardMessages(
+            chat_id=int(log_channel),
+            from_chat_id=dest_id,
+            message_ids=[sent_message.id],
+        )
+        if config.is_error(res):
+            raise Exception(config.err_text(res))
+    except Exception as e:
+        config.logger.error(f"Log error: {e}")
+
+
+# ── PTB SEND (< 45 MB) — reads straight from disk ─────────────────────────────
+
+async def _ptb_send_media(
+    ptb_bot, dest_id: int,
+    file_path: str, file_name: str, mime_type: str, caption: str,
+    dest_topic_id, is_photo: bool, is_video: bool, is_audio: bool,
+    thumb_path: str = None,
+    duration: int = 0,
+    width: int = 0,
+    height: int = 0,
+) -> bool:
+    """
+    Upload a file living on disk to dest_id via PTB Bot API.
+    Unchanged from the Pyrofork version — PTB is plain HTTP Bot API.
+    """
+    from telegram import InputFile
+    from telegram.error import RetryAfter, Forbidden, TelegramError
+    from telegram.constants import ParseMode as PTBParseMode
+
+    common = {
+        'chat_id':    dest_id,
+        'caption':    caption or '',
+        'parse_mode': PTBParseMode.HTML,
+    }
+    if dest_topic_id:
+        common['message_thread_id'] = dest_topic_id
+
+    for attempt in range(config.MAX_RETRIES):
+        file_handle  = None
+        thumb_handle = None
+        try:
+            file_handle = open(file_path, 'rb')
+            inp = InputFile(file_handle, filename=file_name)
+
+            thumb_inp = None
+            if thumb_path and os.path.exists(thumb_path):
+                thumb_handle = open(thumb_path, 'rb')
+                thumb_inp = InputFile(thumb_handle, filename="thumb.jpg")
+
+            if is_photo:
+                await ptb_bot.send_photo(**common, photo=inp)
+
+            elif is_video:
+                await ptb_bot.send_video(
+                    **common,
+                    video=inp,
+                    supports_streaming=True,
+                    thumbnail=thumb_inp,
+                    duration=duration or None,
+                    width=width   or None,
+                    height=height or None,
+                )
+
+            elif is_audio:
+                await ptb_bot.send_audio(
+                    **common,
+                    audio=inp,
+                    duration=duration or None,
+                )
+
+            else:
+                await ptb_bot.send_document(
+                    **common,
+                    document=inp,
+                    filename=file_name,
+                    disable_content_type_detection=True,
+                )
+
+            return True
+
+        except RetryAfter as e:
+            wait = e.retry_after + 2
+            config.logger.warning(f"⏳ PTB RetryAfter {e.retry_after}s — waiting {wait}s")
+            await asyncio.sleep(wait)
+
+        except Forbidden as e:
+            raise PermissionError(
+                f"❌ **Bot cannot post in destination channel.**\n"
+                f"Make sure the bot is **Full Admin** there.\n`{e}`"
+            )
+
+        except TelegramError as e:
+            backoff = min(10 * (2 ** attempt), 120)
+            config.logger.error(
+                f"PTB send attempt {attempt+1}/{config.MAX_RETRIES} failed "
+                f"for {file_name}: {e} — retrying in {backoff}s"
+            )
+            await asyncio.sleep(backoff)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as e:
+            backoff = min(10 * (2 ** attempt), 120)
+            config.logger.error(f"PTB unknown error (attempt {attempt+1}): {e} — retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+
+        finally:
+            if file_handle:
+                try: file_handle.close()
+                except Exception: pass
+            if thumb_handle:
+                try: thumb_handle.close()
+                except Exception: pass
+
+    return False
+
+
+# ── BOT_CLIENT DISK UPLOAD (≥ 45 MB) via TDLib ───────────────────────────────
+
+def _sent_file_id(sent_msg):
+    """Extract the TDLib file id from a pending sent message (for upload progress)."""
+    c = getattr(sent_msg, 'content', None)
+    name = _cname(c)
+    try:
+        if name == 'MessageVideo':
+            return c.video.video.id
+        if name == 'MessageAudio':
+            return c.audio.audio.id
+        if name == 'MessageDocument':
+            return c.document.document.id
+        if name == 'MessagePhoto':
+            sizes = c.photo.sizes or []
+            return sizes[-1].photo.id if sizes else None
+    except Exception:
+        pass
+    return None
+
+
+async def _bot_disk_upload(
+    bot_client, dest_id: int,
+    file_path: str, file_name: str, file_size: int,
+    caption: str, is_video: bool, is_audio: bool,
+    thumb_path, dest_topic_id,
+    progress_tracker: TransferProgress,
+    duration: int = 0, width: int = 0, height: int = 0,
+) -> tuple:
+    """
+    Upload a file from disk via the TDLib bot client (MTProto).
+    Supports files up to ~2 GiB per call.
+    Returns (success: bool, sent_message).
+
+    TDLib semantics: sendX() returns a PENDING message instantly; we register
+    a future for its temp id and await updateMessageSendSucceeded — the same
+    point in time Pyrogram's blocking call would have returned.
+    """
+    from pytdbot import types
+
+    thumb = None
+    if thumb_path and os.path.exists(str(thumb_path)):
+        thumb = types.InputThumbnail(
+            thumbnail=types.InputFileLocal(path=str(thumb_path)),
+            width=width or 0,
+            height=height or 0,
+        )
+
+    topic = _topic_kw(dest_topic_id)
+    upload_timeout = config.get_upload_timeout(file_size)
+
+    for attempt in range(config.MAX_RETRIES):
+        fut = None
+        try:
+            if is_video:
+                res = await bot_client.sendVideo(
+                    chat_id=dest_id,
+                    video=types.InputFileLocal(path=file_path),
+                    thumbnail=thumb,
+                    caption=caption or '',
+                    parse_mode="html",
+                    supports_streaming=True,
+                    duration=duration or 0,
+                    width=width or 0,
+                    height=height or 0,
+                    **topic,
+                )
+            elif is_audio:
+                res = await bot_client.sendAudio(
+                    chat_id=dest_id,
+                    audio=types.InputFileLocal(path=file_path),
+                    caption=caption or '',
+                    parse_mode="html",
+                    duration=duration or 0,
+                    **topic,
+                )
+            else:
+                res = await bot_client.sendDocument(
+                    chat_id=dest_id,
+                    document=types.InputFileLocal(path=file_path),
+                    caption=caption or '',
+                    parse_mode="html",
+                    disable_content_type_detection=True,
+                    **topic,
+                )
+
+            if config.is_error(res):
+                retry = config.get_retry_after(res)
+                if retry:
+                    raise FloodWaitError(retry)
+                _raise_if_error(res, "(send)")
+
+            # Message accepted by TDLib, upload running in background.
+            temp_id = getattr(res, 'id', None)
+            fut = register_pending_send(temp_id)
+
+            fid = _sent_file_id(res)
+            if fid is not None and progress_tracker:
+                watch_file(fid, progress_tracker, 'upload')
+
+            try:
+                final_msg = await asyncio.wait_for(fut, timeout=upload_timeout)
+            finally:
+                if fid is not None and progress_tracker:
+                    unwatch_file(fid, progress_tracker)
+
+            if final_msg is None:
+                raise RuntimeError("send succeeded but final message missing")
+            return True, final_msg
+
+        except asyncio.TimeoutError:
+            config.logger.warning(
+                f"⏱️ Upload STALLED past {upload_timeout:.0f}s on attempt "
+                f"{attempt+1}/{config.MAX_RETRIES} for {file_name} "
+                f"({human_readable_size(file_size)}) — treating as failed "
+                f"attempt, retrying with backoff instead of hanging forever."
+            )
+            # Best effort: cancel the pending message so a late success
+            # doesn't duplicate the file after our retry.
+            try:
+                if fut is not None:
+                    cancel_pending_send(getattr(res, 'id', 0))
+                await bot_client.deleteMessages(
+                    chat_id=dest_id, message_ids=[getattr(res, 'id', 0)], revoke=True
+                )
+            except Exception:
+                pass
+            backoff = min(10 * (2 ** attempt), 120)
+            await asyncio.sleep(backoff)
+
+        except FloodWaitError as e:
+            wait = e.x + 5
+            config.logger.warning(
+                f"⏳ FloodWait {e.x}s on upload attempt {attempt+1} — "
+                f"waiting {wait}s (not counted as failure)"
+            )
+            if fut is not None:
+                cancel_pending_send(getattr(res, 'id', 0) if 'res' in dir() else 0)
+            await asyncio.sleep(wait)
+
+        except PermissionError:
+            if fut is not None and 'res' in dir():
+                cancel_pending_send(getattr(res, 'id', 0))
+            raise
+
+        except asyncio.CancelledError:
+            if fut is not None and 'res' in dir():
+                cancel_pending_send(getattr(res, 'id', 0))
+            raise
+
+        except Exception as e:
+            backoff = min(10 * (2 ** attempt), 120)
+            config.logger.error(
+                f"Upload attempt {attempt+1}/{config.MAX_RETRIES} failed "
+                f"for {file_name}: {type(e).__name__}: {e} — retrying in {backoff}s"
+            )
+            await asyncio.sleep(backoff)
+
+    return False, None
+
+
+# ── MAIN TRANSFER FUNCTION ────────────────────────────────────────────────────
+
+async def transfer_process(
+    event,
+    user_client,
+    bot_client,
+    source_id,
+    dest_id: int,
+    start_msg: int,
+    end_msg: int,
+    session_id: str,
+    log_channel=None,
+    topic_id=None,
+    dest_topic_id=None,
+):
+    from session_manager import SessionExpiredError
+
+    session_data = config.active_sessions.get(session_id, {})
+    settings     = session_data.get('settings', {})
+    user_id      = session_data.get('user_id')
+    task_id      = session_data.get('task_id')
+
+    mode_text = "Standard"
+    if topic_id      is not None: mode_text += f" | 🧵 Src Topic {topic_id}"
+    if dest_topic_id is not None: mode_text += f" | 🎯 Dst Topic {dest_topic_id}"
+
+    async def _event_respond(text, reply_markup=None):
+        if hasattr(event, 'respond'):
+            return await event.respond(text, reply_markup=reply_markup)
+        return await event.reply_text(text, reply_markup=reply_markup)
+
+    status_message = await _event_respond(
+        f"🔍 **Checking permissions…**\n"
+        f"⚡ Mode: {mode_text}\n"
+        f"📍 Source: `{source_id}` → Dest: `{dest_id}`",
+        reply_markup=get_progress_keyboard()
+    )
+    session_data['task_object'] = asyncio.current_task()
+
+    # ── STEP 0: Preflight ─────────────────────────────────────────────────────
+    preflight_ok, preflight_err = await _preflight_check(bot_client, dest_id)
+    if not preflight_ok:
+        await safe_edit_message(status_message, preflight_err)
+        config.active_sessions.pop(session_id, None)
+        return 'stopped_errors', config.RETRY_AFTER_FAILURE_SECONDS
+
+    # ── STEP 0b: PTB Bot singleton ────────────────────────────────────────────
+    try:
+        ptb_bot = await config.get_ptb_bot()
+    except Exception as e:
+        config.logger.warning(f"PTB init failed (will use bot_client only): {e}")
+        ptb_bot = None
+
+    # ── STEP 0c: Download custom thumbnail once (if user set one) ─────────────
+    custom_thumb_path = None
+    thumbnail_file_id = settings.get('thumbnail_file_id')
+    if thumbnail_file_id:
+        try:
+            custom_thumb_path = f"/tmp/custom_thumb_{user_id}_{int(time.time())}.jpg"
+            await td_download_remote_id(bot_client, thumbnail_file_id, custom_thumb_path)
+            config.logger.info(f"✅ Custom thumbnail ready (disk): {custom_thumb_path}")
+        except Exception as e:
+            config.logger.warning(f"Custom thumbnail download failed: {e}")
+            custom_thumb_path = None
+
+    thumb_note = " | 🖼️ Custom Thumb" if custom_thumb_path else ""
+    await safe_edit_message(
+        status_message,
+        f"🚀 **Starting Transfer…**\n"
+        f"⚡ Mode: {mode_text}{thumb_note}\n"
+        f"📍 Source: `{source_id}` → Dest: `{dest_id}`",
+        reply_markup=get_progress_keyboard()
+    )
+
+    # ── State vars ────────────────────────────────────────────────────────────
+    total_success      = 0
+    total_size         = 0
+    total_skipped      = 0
+    deleted_msgs       = 0
+    consecutive_errors = 0
+    idx                = 0
+    last_seen_id       = start_msg - 1
+    overall_start      = time.time()
+    chat_id            = getattr(event, 'chat_id', None) or session_data.get('chat_id')
+    stop_reason         = None
+
+    # ── Resume pointer (identical semantics to the Pyrofork engine) ───────────
+    last_committed_id   = start_msg - 1
+    stuck_msg_id        = None
+    stuck_attempts      = 0
+    pending_retry_delay = None
+
+    # Self-healing: trust a matching existing checkpoint over the handed-in
+    # start_msg (see Pyrofork version for the full rationale).
+    if user_id:
+        try:
+            _existing_ckpt = await db.get_transfer_checkpoint(user_id)
+        except Exception:
+            _existing_ckpt = None
+        if (
+            _existing_ckpt
+            and str(_existing_ckpt.get('source_id')) == str(source_id)
+            and str(_existing_ckpt.get('dest_id'))   == str(dest_id)
+            and int(_existing_ckpt.get('end_msg', 0)) == int(end_msg)
+        ):
+            saved_current = int(_existing_ckpt.get('current_msg', last_committed_id))
+            last_committed_id = saved_current
+            stuck_msg_id      = _existing_ckpt.get('stuck_msg_id')
+            stuck_attempts    = _existing_ckpt.get('stuck_attempts', 0)
+
+    effective_start_msg = last_committed_id + 1
+    last_seen_id         = last_committed_id
+
+    async def _should_stop() -> bool:
+        if config.global_stop_flag or session_id not in config.active_sessions:
+            return True
+        if session_data.get('stop_flag'):
+            return True
+        if task_id:
+            return await db.check_stop_signal(task_id)
+        return False
+
+    def _progress_text(title: str, extra: str = "") -> str:
+        ram_used  = session_data.get('ram_used',  0)
+        ram_total = session_data.get('ram_total', 0)
+        ram_line  = _ram_bar(ram_used, ram_total)
+        return f"{title}\n{ram_line}{extra}".strip()
+
+    async def _commit_or_hold(msg_id: int, ok: bool) -> bool:
+        nonlocal last_committed_id, stuck_msg_id, stuck_attempts
+
+        if msg_id <= last_committed_id:
+            return False
+
+        if ok:
+            last_committed_id = msg_id
+            stuck_msg_id, stuck_attempts = None, 0
+            return False
+
+        if stuck_msg_id == msg_id:
+            stuck_attempts += 1
+        else:
+            stuck_msg_id, stuck_attempts = msg_id, 1
+        return True
+
+    def _stuck_backoff_seconds() -> int:
+        return min(
+            config.RETRY_AFTER_FAILURE_SECONDS * (2 ** max(stuck_attempts - 1, 0)),
+            config.STUCK_BACKOFF_MAX,
+        )
+
+    async def _checkpoint_now():
+        if not user_id:
+            return
+        try:
+            await db.save_transfer_checkpoint(user_id, {
+                'chat_id':        chat_id,
+                'source_id':      str(source_id),
+                'dest_id':        str(dest_id),
+                'current_msg':    last_committed_id,
+                'end_msg':        end_msg,
+                'settings':       settings,
+                'topic_id':       topic_id,
+                'dest_topic_id':  dest_topic_id,
+                'log_channel':    log_channel,
+                'task_id':        task_id,
+                'total_success':  total_success,
+                'total_skipped':  total_skipped,
+                'total_size':     total_size,
+                'status':         'running',
+                'stuck_msg_id':   stuck_msg_id,
+                'stuck_attempts': stuck_attempts,
+            })
+        except Exception as ckpt_err:
+            config.logger.warning(f"Checkpoint save failed: {ckpt_err}")
+
+    async def _notify_retry(msg_id: int):
+        if stuck_attempts in (1, 2, 5) or stuck_attempts % 10 == 0:
+            wait_s = _stuck_backoff_seconds()
+            await safe_edit_message(status_message, _progress_text(
+                f"⏳ **Message {msg_id} failed (attempt {stuck_attempts}).**\n"
+                f"It will NOT be skipped — auto-resume retries it in ~{wait_s}s."
+            ))
+
+    # ── MAIN LOOP ─────────────────────────────────────────────────────────────
+    try:
+        await safe_edit_message(status_message, "🔍 **Scanning messages…**",
+                                reply_markup=get_progress_keyboard())
+
+        async for message in robust_iter_messages(
+            user_client, source_id, effective_start_msg, end_msg, topic_id
+        ):
+            if await _should_stop():
+                stop_reason = 'user_stop'
+                await safe_edit_message(
+                    status_message,
+                    _progress_text("🚫 **Stopped by user/admin.**")
+                )
+                break
+
+            if message.id > last_seen_id + 1:
+                deleted_msgs += message.id - last_seen_id - 1
+            last_seen_id = message.id
+            idx         += 1
+
+            # Skip service messages (pins, joins, etc.) — the ONLY things
+            # that skip. Everything else commits-or-holds.
+            if is_service_message(message):
+                await _commit_or_hold(message.id, True)
+                await _checkpoint_now()
+                continue
+
+            # ── Inter-file pacing ─────────────────────────────────────────
+            await asyncio.sleep(config.SLEEP_BETWEEN_FILES)
+            if idx % 10 == 0:
+                await asyncio.sleep(config.SLEEP_EVERY_10)
+
+            sent_message = None
+            success      = False
+            temp_path    = None
+            thumb_path   = None
+
+            try:
+                content_name = _cname(getattr(message, 'content', None))
+
+                # ══ TEXT / WEB-PAGE ═══════════════════════════════════════
+                has_web_page = content_name == 'MessageText' and (
+                    getattr(message.content, 'link_preview', None) is not None
+                )
+                if content_name == 'MessageText' or content_name in ('', 'None'):
+                    text_ok = True
+                    plain = message_plain_text(message)
+                    if plain:
+                        try:
+                            modified_text = apply_caption_manipulations(message, settings)
+                            res = await bot_client.sendTextMessage(
+                                dest_id, modified_text,
+                                parse_mode="html",
+                                **_topic_kw(dest_topic_id),
+                            )
+                            _raise_if_error(res, "(text)")
+                            sent_message         = res
+                            total_success      += 1
+                            consecutive_errors  = 0
+                            if log_channel:
+                                try:
+                                    await bot_client.sendTextMessage(
+                                        int(log_channel),
+                                        f"📝 **Log**\n{modified_text[:80]}",
+                                        parse_mode="html",
+                                    )
+                                except Exception:
+                                    pass
+                        except FloodWaitError:
+                            raise
+                        except PermissionError:
+                            raise
+                        except Exception as txt_e:
+                            config.logger.error(f"Text send failed: {txt_e}")
+                            text_ok             = False
+                            total_skipped      += 1
+                            consecutive_errors += 1
+                    should_stop = await _commit_or_hold(message.id, text_ok)
+                    await _checkpoint_now()
+                    if should_stop:
+                        stop_reason = 'errors'
+                        await _notify_retry(message.id)
+                        break
+                    continue
+
+                # ══ SPECIAL MEDIA (polls, geo, contacts, dice…) ═══════════
+                if is_special_media(message):
+                    sm_ok = True
+                    try:
+                        res = await user_client.forwardMessages(
+                            chat_id=dest_id,
+                            from_chat_id=message.chat_id,
+                            message_ids=[message.id],
+                            send_copy=True,
+                            **_topic_kw(dest_topic_id),
+                        )
+                        _raise_if_error(res, "(special media copy)")
+                        total_success      += 1
+                        consecutive_errors  = 0
+                    except FloodWaitError:
+                        raise
+                    except Exception as sm_e:
+                        config.logger.error(f"Special media failed: {sm_e}")
+                        sm_ok               = False
+                        total_skipped      += 1
+                        consecutive_errors += 1
+                    should_stop = await _commit_or_hold(message.id, sm_ok)
+                    await _checkpoint_now()
+                    if should_stop:
+                        stop_reason = 'errors'
+                        await _notify_retry(message.id)
+                        break
+                    continue
+
+                # ══ FILE INFO ═════════════════════════════════════════════
+                file_name, mime_type, is_video_mode = get_target_info(message)
+                if not file_name:
+                    config.logger.warning(f"Msg {message.id}: cannot derive filename — skipping")
+                    total_skipped += 1
+                    continue
+
+                file_name        = sanitize_filename(apply_filename_manipulations(file_name, settings))
+                modified_caption = apply_caption_manipulations(message, settings)
+                file_size        = get_media_file_size(message)
+
+                is_photo = content_name == 'MessagePhoto'
+                is_image = (not is_photo) and ("image" in (mime_type or ""))
+                is_audio = bool(
+                    content_name in ('MessageAudio', 'MessageVoiceNote') or
+                    "audio" in (mime_type or "") or "voice" in (mime_type or "")
+                )
+
+                # ── Media metadata (used by both PTB and TDLib paths) ──────
+                media_duration     = 0
+                media_width        = 0
+                media_height       = 0
+                auto_thumb_remote  = None
+                if is_video_mode:
+                    media_duration, media_width, media_height, auto_thumb_remote = \
+                        get_video_metadata(message)
+                elif content_name == 'MessageVideoNote':
+                    media_duration = getattr(message.content.video_note, 'duration', 0) or 0
+                elif is_audio:
+                    if content_name == 'MessageAudio':
+                        media_duration = getattr(message.content.audio, 'duration', 0) or 0
+                    elif content_name == 'MessageVoiceNote':
+                        media_duration = getattr(message.content.voice_note, 'duration', 0) or 0
+
+                start_time = time.time()
+
+                # ══ PATH A: Photo / Image ═════════════════════════════════
+                if (is_photo or is_image):
+                    try:
+                        temp_path  = f"/tmp/tf_img_{user_id}_{message.id}_{int(time.time())}.jpg"
+                        downloaded = await td_download(user_client, message, temp_path)
+                        if not downloaded or not os.path.exists(str(downloaded)):
+                            raise RuntimeError("download returned empty path")
+                        temp_path = str(downloaded)
+
+                        if ptb_bot:
+                            ok = await _ptb_send_media(
+                                ptb_bot, dest_id, temp_path, file_name,
+                                'image/jpeg', modified_caption, dest_topic_id,
+                                is_photo=True, is_video=False, is_audio=False,
+                            )
+                            if ok:
+                                success      = True
+                                sent_message = True
+
+                        if not success:
+                            from pytdbot import types as _t
+                            res = await bot_client.sendPhoto(
+                                chat_id=dest_id,
+                                photo=_t.InputFileLocal(path=temp_path),
+                                caption=modified_caption,
+                                parse_mode="html",
+                                **_topic_kw(dest_topic_id),
+                            )
+                            _raise_if_error(res, "(photo)")
+                            sent_message = res
+                            success      = True
+
+                    except FloodWaitError:
+                        raise
+                    except PermissionError:
+                        raise
+                    except Exception as img_e:
+                        config.logger.error(f"Image send failed: {img_e}")
+
+                # ══ PATH B: Non-image files (videos, docs, audio…) ════════
+                elif not (is_photo or is_image):
+                    progress_tracker = TransferProgress(
+                        file_name, file_size, status_message, session_data,
+                        msg_id=message.id,
+                    )
+
+                    # ── PTB path: < 45 MB — downloaded to disk, never RAM ────
+                    if ptb_bot and 0 < file_size < config.PTB_SMALL_FILE_LIMIT:
+                        small_thumb_path = None
+                        try:
+                            temp_path  = f"/tmp/tf_{user_id}_{message.id}_{int(time.time())}"
+                            downloaded = await td_download(
+                                user_client, message, temp_path,
+                                tracker=progress_tracker,
+                            )
+                            if not downloaded or not os.path.exists(str(downloaded)):
+                                raise RuntimeError("download returned empty path")
+                            temp_path = str(downloaded)
+
+                            # Thumbnail: custom thumb wins, else the video's own.
+                            if is_video_mode:
+                                if custom_thumb_path and os.path.exists(custom_thumb_path):
+                                    small_thumb_path = custom_thumb_path
+                                elif auto_thumb_remote:
+                                    try:
+                                        small_thumb_path = f"/tmp/thumb_{user_id}_{message.id}.jpg"
+                                        await td_download_remote_id(
+                                            user_client, auto_thumb_remote, small_thumb_path,
+                                        )
+                                    except Exception as thumb_e:
+                                        config.logger.warning(f"Auto-thumb fetch failed: {thumb_e}")
+                                        small_thumb_path = None
+
+                            ok = await _ptb_send_media(
+                                ptb_bot, dest_id, temp_path, file_name, mime_type or '',
+                                modified_caption, dest_topic_id,
+                                is_photo=False,
+                                is_video=is_video_mode,
+                                is_audio=is_audio,
+                                thumb_path=small_thumb_path,
+                                duration=media_duration,
+                                width=media_width,
+                                height=media_height,
+                            )
+                            if ok:
+                                success      = True
+                                sent_message = True
+
+                        except FloodWaitError:
+                            raise
+                        except PermissionError:
+                            raise
+                        except Exception as ptb_e:
+                            config.logger.warning(
+                                f"PTB path failed for {file_name} ({ptb_e}) "
+                                f"— falling back to bot_client disk upload"
+                            )
+                        finally:
+                            if small_thumb_path and small_thumb_path != custom_thumb_path \
+                               and os.path.exists(small_thumb_path):
+                                try: os.remove(small_thumb_path)
+                                except Exception: pass
+
+                    # ── TDLib bot_client disk path: ≥ 45 MB or PTB failed ─────
+                    if not success:
+                        temp_path = f"/tmp/tf_{user_id}_{message.id}_{int(time.time())}"
+
+                        # Video's own thumbnail (custom thumb takes priority)
+                        if is_video_mode and auto_thumb_remote and not custom_thumb_path:
+                            try:
+                                thumb_path = f"/tmp/thumb_{user_id}_{message.id}.jpg"
+                                await td_download_remote_id(
+                                    user_client, auto_thumb_remote, thumb_path,
+                                )
+                            except Exception as thumb_e:
+                                config.logger.warning(f"Auto-thumb fetch failed: {thumb_e}")
+                                thumb_path = None
+
+                        effective_thumb = custom_thumb_path or thumb_path
+
+                        if file_size > SPLIT_THRESHOLD:
+                            # ── Split upload for very large files ─────────
+                            downloaded = await td_download(
+                                user_client, message, temp_path,
+                                tracker=progress_tracker,
+                            )
+                            actual_size = os.path.getsize(str(downloaded))
+                            parts       = math.ceil(actual_size / SPLIT_THRESHOLD)
+                            config.logger.info(f"✂️ Splitting into {parts} parts")
+
+                            all_parts_ok = True
+                            with open(str(downloaded), 'rb') as full_file:
+                                for i in range(parts):
+                                    if await _should_stop():
+                                        all_parts_ok = False
+                                        break
+                                    part_num  = i + 1
+                                    part_name = (
+                                        f"{os.path.splitext(file_name)[0]}"
+                                        f".part{part_num:03d}"
+                                        f"{os.path.splitext(file_name)[1]}"
+                                    )
+                                    part_path = f"/tmp/tf_part_{user_id}_{message.id}_{i}"
+                                    part_data = full_file.read(SPLIT_THRESHOLD)
+                                    with open(part_path, 'wb') as pf:
+                                        pf.write(part_data)
+
+                                    part_cap = f"{modified_caption}\n\n(Part {part_num}/{parts})"
+                                    part_tracker = TransferProgress(
+                                        part_name, len(part_data),
+                                        status_message, session_data,
+                                        msg_id=message.id,
+                                    )
+                                    part_ok, _ = await _bot_disk_upload(
+                                        bot_client, dest_id,
+                                        part_path, part_name, len(part_data),
+                                        part_cap,
+                                        is_video=False, is_audio=False,
+                                        thumb_path=None,
+                                        dest_topic_id=dest_topic_id,
+                                        progress_tracker=part_tracker,
+                                    )
+                                    try: os.remove(part_path)
+                                    except Exception: pass
+
+                                    if not part_ok:
+                                        all_parts_ok = False
+                                        break
+
+                            try: os.remove(str(downloaded))
+                            except Exception: pass
+                            temp_path = None
+
+                            if all_parts_ok:
+                                success      = True
+                                sent_message = True
+
+                        else:
+                            # ── Normal disk download → upload ──────────────
+                            downloaded = await td_download(
+                                user_client, message, temp_path,
+                                tracker=progress_tracker,
+                            )
+                            if not downloaded or not os.path.exists(str(downloaded)):
+                                raise RuntimeError("download returned empty path")
+                            temp_path = str(downloaded)
+
+                            progress_tracker.reset_for_upload()
+
+                            ok, sent_message = await _bot_disk_upload(
+                                bot_client, dest_id,
+                                temp_path, file_name, file_size,
+                                modified_caption,
+                                is_video=is_video_mode,
+                                is_audio=is_audio,
+                                thumb_path=effective_thumb,
+                                dest_topic_id=dest_topic_id,
+                                progress_tracker=progress_tracker,
+                                duration=media_duration,
+                                width=media_width,
+                                height=media_height,
+                            )
+                            success = ok
+
+                # ══ OUTCOME ══════════════════════════════════════════════
+                if success:
+                    total_success      += 1
+                    consecutive_errors  = 0
+                    elapsed             = time.time() - start_time
+                    total_size         += file_size
+
+                    if log_channel and sent_message:
+                        await log_transfer(
+                            bot_client, log_channel, sent_message,
+                            session_id, dest_id, file_name
+                        )
+
+                else:
+                    config.logger.error(f"❌ Attempt failed, will retry via auto-resume: {file_name}")
+                    total_skipped += 1
+                    await safe_edit_message(
+                        status_message,
+                        _progress_text(
+                            f"❌ **Failed:** `{file_name[:35]}`",
+                            "\nThis file will NOT be skipped — auto-resume retries it."
+                        ),
+                        reply_markup=get_progress_keyboard(),
+                    )
+
+                should_stop = await _commit_or_hold(message.id, success)
+                await _checkpoint_now()
+                if should_stop:
+                    stop_reason = 'errors'
+                    await _notify_retry(message.id)
+                    break
+
+            except FloodWaitError as fw:
+                # Session/account-level wait — honor Telegram's exact delay.
+                wait_s = int(fw.x or 20)
+                config.logger.warning(
+                    f"⏳ FloodWait {wait_s}s on msg {message.id} — "
+                    f"stopping run, auto-resume honors this wait exactly."
+                )
+                total_skipped += 1
+                await _commit_or_hold(message.id, False)
+                await _checkpoint_now()
+                stop_reason          = 'errors'
+                pending_retry_delay  = wait_s + 15
+                await safe_edit_message(status_message, _progress_text(
+                    f"⏳ **Telegram flood-wait hit** (message {message.id}).\n"
+                    f"Nothing skipped — auto-resume continues in ~{pending_retry_delay}s."
+                ))
+                break
+
+            except PermissionError as perm_e:
+                await _commit_or_hold(message.id, False)
+                await _checkpoint_now()
+                stop_reason = 'errors'
+                await safe_edit_message(status_message, str(perm_e))
+                config.logger.error(f"Permission error — stopping: {perm_e}")
+                break
+
+            except asyncio.CancelledError:
+                raise
+
+            except MemoryError:
+                config.logger.error(f"💥 OOM on msg {message.id} — will retry via auto-resume")
+                total_skipped += 1
+                should_stop = await _commit_or_hold(message.id, False)
+                await _checkpoint_now()
+                if should_stop:
+                    stop_reason = 'errors'
+                    await _notify_retry(message.id)
+                    break
+
+            except Exception as e:
+                config.logger.error(f"❌ Error on msg {message.id}: {e}", exc_info=True)
+                total_skipped += 1
+                should_stop = await _commit_or_hold(message.id, False)
+                await _checkpoint_now()
+                if should_stop:
+                    stop_reason = 'errors'
+                    await _notify_retry(message.id)
+                    break
+
+            finally:
+                for p in [temp_path, thumb_path]:
+                    if p and os.path.exists(str(p)):
+                        try: os.remove(str(p))
+                        except Exception: pass
+
+        # ── POST-LOOP ─────────────────────────────────────────────────────────
+        if last_seen_id < end_msg and last_seen_id >= start_msg:
+            deleted_msgs += end_msg - last_seen_id
+
+        overall_time      = time.time() - overall_start
+        avg_speed         = total_size / overall_time / (1024 * 1024) if overall_time > 0 else 0
+        actually_complete = last_committed_id >= end_msg
+
+        header  = "🏁 **Transfer Complete!**" if actually_complete else "🏁 **Transfer Finished**"
+        summary = (
+            f"{header}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Success:         `{total_success}`\n"
+        )
+        if deleted_msgs > 0:
+            summary += f"🗑️ Not Found:       `{deleted_msgs}` _(deleted/restricted)_\n"
+        label = "🔁 Retrying:" if not actually_complete else "⏭️ Skipped:"
+        summary += (
+            f"{label}         `{total_skipped}`\n"
+            f"📦 Total Size:      `{human_readable_size(total_size)}`\n"
+            f"⚡ Avg Speed:       `{avg_speed:.1f} MB/s`\n"
+            f"⏱️ Time:            `{time_formatter(overall_time)}`"
+        )
+        if not actually_complete and stop_reason != 'user_stop':
+            wait_s = pending_retry_delay or _stuck_backoff_seconds()
+            summary += (
+                f"\n\n🔄 *Nothing was skipped — auto-resume continues from the "
+                f"exact last point in ~{wait_s}s.*"
+            )
+        await safe_edit_message(status_message, summary)
+
+        if actually_complete and user_id:
+            await db.clear_transfer_checkpoint(user_id)
+            config.logger.info(f"✅ Checkpoint cleared for user {user_id}")
+            return 'completed', None
+
+        if stop_reason == 'user_stop':
+            return 'stopped_by_user', None
+
+        return 'stopped_errors', (pending_retry_delay or _stuck_backoff_seconds())
+
+    except asyncio.CancelledError:
+        await safe_edit_message(
+            status_message,
+            "🚫 **Task Forcefully Revoked**\n💡 Use /clone to start a new transfer."
+        )
+        return 'stopped_by_user', None
+
+    except Exception as e:
+        await safe_edit_message(
+            status_message,
+            f"💥 **Critical Error:**\n`{str(e)[:200]}`\n🔄 Auto-resume will retry shortly."
+        )
+        config.logger.error(f"Transfer crashed: {e}", exc_info=True)
+        return 'stopped_errors', config.RETRY_AFTER_FAILURE_SECONDS
+
+    finally:
+        if custom_thumb_path and os.path.exists(custom_thumb_path):
+            try: os.remove(custom_thumb_path)
+            except Exception: pass
+
+        config.active_sessions.pop(session_id, None)
+        if not task_id:
+            try:
+                await session_manager.stop_user_session(user_client)
+            except Exception:
+                pass
+        config.logger.info("✅ Transfer cleanup complete")
