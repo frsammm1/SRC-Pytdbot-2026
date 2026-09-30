@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py  –  Bot entry point  (v7.0 — TDLib / pytdbot)
+main.py  –  Bot entry point  (v7.1 — TDLib / pytdbot)
 
 Changes from v6.x (Pyrofork):
   • pyrogram.Client + idle() → pytdbot.Client(token=…) + client.idle()
@@ -10,6 +10,12 @@ Changes from v6.x (Pyrofork):
   • updateFile / updateMessageSendSucceeded events are bridged into
     progress.py so in-process fallback transfers get progress bars and
     reliable upload completion too.
+
+v7.1 hotfix (login crash):
+  • TDLib allows exactly ONE td_receive() thread per process. v7.0 let every
+    Client spawn its own ClientManager/receiver → starting a login client
+    next to the bot client aborted the whole process (SIGABRT / status 134)
+    before the OTP could be sent. All clients now share ONE ClientManager.
 """
 
 import asyncio
@@ -84,7 +90,16 @@ async def main():
     config.logger.info("💾 Database Initialised")
 
     # ── TDLib bot client ──────────────────────────────────────────────────────
-    from pytdbot import Client
+    #
+    # ⚠️ TDLib RULE: exactly ONE td_receive() thread per process.
+    # Every pytdbot Client that calls .start() alone spawns its own
+    # ClientManager → its own receiver thread → a second client (login,
+    # transfer, worker bot) crashes the whole process with SIGABRT
+    # ("Receive must not be called simultaneously from two different
+    # threads"). So ALL clients in this process (bot + temp login clients +
+    # in-process transfer user clients) live on ONE shared ClientManager.
+    from pytdbot import Client, ClientManager
+    from session_manager import session_manager, wait_until_ready
 
     bot_client = Client(
         token=config.BOT_TOKEN,
@@ -99,6 +114,14 @@ async def main():
         td_verbosity=1,
         default_parse_mode="markdown",
     )
+
+    # Shared manager: created with a LIST so start_clients_on_add=True —
+    # without that, stopping any managed client would close the whole manager
+    # and kill the bot's update stream.
+    client_manager = ClientManager(
+        [bot_client], verbosity=1, loop=asyncio.get_running_loop()
+    )
+    session_manager.set_client_manager(client_manager)
 
     # ── Wire TDLib file/send events into the progress trackers ────────────────
 
@@ -120,7 +143,8 @@ async def main():
     # ── Register all command/callback handlers BEFORE start ───────────────────
     register_handlers(bot_client)
 
-    await bot_client.start()
+    await client_manager.start()          # starts receiver thread + bot client
+    await wait_until_ready(bot_client)    # shared-manager start() doesn't block
     config.logger.info("✅ Bot client started (TDLib)")
 
     # ── Web server ────────────────────────────────────────────────────────────
@@ -151,7 +175,18 @@ async def main():
 
     # ── Run until Ctrl-C ──────────────────────────────────────────────────────
     await bot_client.idle()
-    await bot_client.stop()
+
+    # Graceful shutdown: stop the bot client, then close the shared manager —
+    # its receiver thread is non-daemon and blocked in td_receive(), so
+    # skipping this hangs the interpreter at exit (stuck dyno until TTL).
+    try:
+        await bot_client.stop()
+    except Exception:
+        pass
+    try:
+        await client_manager.close()
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':

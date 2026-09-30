@@ -285,9 +285,31 @@ async def main(user_id: int, task_id: str):
     reporter_task = asyncio.create_task(ram_reporter(user_id, task_id, stop_event))
 
     # ── Connect bot_client (TDLib bot) ──────────────────────────────────────
+    # Same TDLib rule as main.py: ONE shared ClientManager per process —
+    # bot + user clients both attach to it (a second receiver thread would
+    # SIGABRT the whole dyno). Manager created with a LIST so stopping a
+    # managed client never closes the manager itself.
+    from pytdbot import ClientManager
+    from session_manager import wait_until_ready
+
+    client_manager = ClientManager([], verbosity=1, loop=asyncio.get_running_loop())
+    session_manager.set_client_manager(client_manager)
+    await client_manager.start()
+
     bot_client = make_bot_client("worker_bot")
-    await bot_client.start()
+    await client_manager.add_client(bot_client, start_client=True)
+    await wait_until_ready(bot_client, timeout=90)
     logger.info("✅ Bot client started (TDLib)")
+
+    async def _shutdown_clients():
+        stop_event.set()
+        reporter_task.cancel()
+        try: await session_manager.stop_user_session(user_client)
+        except Exception: pass
+        try: await bot_client.stop()
+        except Exception: pass
+        try: await client_manager.close()
+        except Exception: pass
 
     async def _abort(msg: str):
         try:
@@ -296,10 +318,7 @@ async def main(user_id: int, task_id: str):
             pass
         await db.update_task_status(task_id, 'failed')
         await db.clear_user_dyno(user_id)
-        stop_event.set()
-        reporter_task.cancel()
-        try: await bot_client.stop()
-        except Exception: pass
+        await _shutdown_clients()
 
     # ── Connect user_client (restored TDLib session) ───────────────────────
     user_client = None
@@ -342,12 +361,7 @@ async def main(user_id: int, task_id: str):
     if not preflight_ok:
         await db.update_task_status(task_id, 'failed')
         await db.clear_user_dyno(user_id)
-        stop_event.set()
-        reporter_task.cancel()
-        try: await bot_client.stop()
-        except Exception: pass
-        try: await session_manager.stop_user_session(user_client)
-        except Exception: pass
+        await _shutdown_clients()
         return
 
     # ── Worker preflight: resolve SOURCE peer ──────────────────────────────
@@ -357,12 +371,7 @@ async def main(user_id: int, task_id: str):
     if not source_preflight_ok:
         await db.update_task_status(task_id, 'failed')
         await db.clear_user_dyno(user_id)
-        stop_event.set()
-        reporter_task.cancel()
-        try: await bot_client.stop()
-        except Exception: pass
-        try: await session_manager.stop_user_session(user_client)
-        except Exception: pass
+        await _shutdown_clients()
         return
 
     # ── Build MockEvent and session stub ───────────────────────────────────
@@ -413,13 +422,8 @@ async def main(user_id: int, task_id: str):
         await db.schedule_task_retry(task_id, config.RETRY_AFTER_FAILURE_SECONDS)
 
     # ── Cleanup ────────────────────────────────────────────────────────────
-    stop_event.set()
-    reporter_task.cancel()
     await db.clear_user_dyno(user_id)
-    try: await bot_client.stop()
-    except Exception: pass
-    try: await session_manager.stop_user_session(user_client)
-    except Exception: pass
+    await _shutdown_clients()
     logger.info("━━ Worker exiting ━━")
 
 

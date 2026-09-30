@@ -21,6 +21,17 @@ KEY DIFFERENCES from the Pyrofork version:
   5. use_file_database / use_chat_info_database / use_message_database are
      all False for login + transfer clients: the archived session stays tiny
      (~100 KB) and downloads don't pollute it.
+
+  6. CRITICAL — ONE ClientManager PER PROCESS: TDLib's td_receive() MUST be
+     called from a single thread. Every Client that calls .start() on its own
+     spawns its own ClientManager → its own receiver thread → the moment a
+     second TDLib client exists (bot + login client, or worker bot + user
+     client), TDLib aborts the WHOLE PROCESS with:
+         "Receive must not be called simultaneously from two different
+          threads" → SIGABRT (Heroku: 'Process exited with status 134').
+     So main.py / worker.py create ONE shared pytdbot.ClientManager and hand
+     it to us via set_client_manager(); every client here is attached with
+     manager.add_client(client, start_client=True) instead of client.start().
 """
 
 import asyncio
@@ -32,6 +43,59 @@ import tarfile
 import time
 
 import config
+
+
+# ── SHARED CLIENT MANAGER (one per process — see module docstring §6) ────────
+
+_shared_manager = None
+
+
+def set_client_manager(manager) -> None:
+    """main.py / worker.py call this once at startup with the process-wide
+    pytdbot.ClientManager that also hosts the bot client."""
+    global _shared_manager
+    _shared_manager = manager
+
+
+def get_client_manager():
+    return _shared_manager
+
+
+async def _start_client(client) -> None:
+    """Start a pytdbot Client WITHOUT creating a second TDLib receiver thread."""
+    if _shared_manager is not None:
+        await _shared_manager.add_client(client, start_client=True)
+    else:
+        # Standalone fallback (single-client scripts/tests only).
+        await client.start()
+
+
+async def _stop_client(client) -> None:
+    """Gracefully close a client and detach it from the shared manager."""
+    try:
+        await client.stop()
+    except Exception:
+        pass
+    if _shared_manager is not None:
+        try:
+            await _shared_manager.delete_client(client.client_id, close_client=False)
+        except Exception:
+            pass
+
+
+async def wait_until_ready(client, timeout: float = 60.0) -> None:
+    """Wait until a client reaches authorizationStateReady (is_authenticated).
+    Used for BOT clients attached to a shared manager, where Client.start()
+    does not block until login."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if getattr(client, 'is_authenticated', False):
+            return
+        if client.authorization_state in ('authorizationStateClosed',
+                                          'authorizationStateClosing'):
+            raise SessionExpiredError("TDLib closed during authorization")
+        await asyncio.sleep(0.5)
+    raise TimeoutError(f"Client auth wait timed out at {client.authorization_state}")
 
 
 # ── EXCEPTIONS (same names/semantics the old handlers.py catches) ────────────
@@ -132,8 +196,9 @@ class SessionManager:
 
     def _make_user_client(self, directory: str):
         from pytdbot import Client
+        import progress as progress_mod
         os.makedirs(directory, exist_ok=True)
-        return Client(
+        client = Client(
             api_id=config.API_ID,
             api_hash=config.API_HASH,
             user_bot=True,
@@ -145,6 +210,17 @@ class SessionManager:
             workers=1,
             td_verbosity=1,
         )
+
+        # Bridge updateFile into progress.py so DOWNLOAD progress bars work
+        # for transfers running on this user client (worker + in-process).
+        @client.on_updateFile()
+        async def _on_user_file(c, update):
+            try:
+                await progress_mod.dispatch_update_file(update.file)
+            except Exception:
+                pass
+
+        return client
 
     # ── LOGIN FLOW ────────────────────────────────────────────────────────────
 
@@ -159,7 +235,7 @@ class SessionManager:
         shutil.rmtree(directory, ignore_errors=True)
 
         client = self._make_user_client(directory)
-        await client.start()
+        await _start_client(client)
         self.temp_clients[user_id] = client
         self.temp_dirs[user_id]    = directory
 
@@ -227,10 +303,7 @@ class SessionManager:
         blob = None
         try:
             if client:
-                try:
-                    await client.stop()
-                except Exception:
-                    pass
+                await _stop_client(client)
             if directory and os.path.isdir(directory):
                 # TDLib flushes td.binlog asynchronously on close — give it a beat.
                 await asyncio.sleep(2)
@@ -250,10 +323,7 @@ class SessionManager:
         client    = self.temp_clients.pop(user_id, None)
         directory = self.temp_dirs.pop(user_id, None)
         if client:
-            try:
-                await client.stop()
-            except Exception:
-                pass
+            await _stop_client(client)
         if directory:
             shutil.rmtree(directory, ignore_errors=True)
 
@@ -273,7 +343,7 @@ class SessionManager:
 
         client = self._make_user_client(directory)
         async with self.semaphore:
-            await client.start()
+            await _start_client(client)
             try:
                 state = await _wait_auth_state(
                     client,
@@ -281,14 +351,12 @@ class SessionManager:
                      'authorizationStateWaitPhoneNumber'},
                 )
             except Exception as e:
-                try: await client.stop()
-                except Exception: pass
+                await _stop_client(client)
                 shutil.rmtree(directory, ignore_errors=True)
                 raise e
 
         if state != 'authorizationStateReady':
-            try: await client.stop()
-            except Exception: pass
+            await _stop_client(client)
             shutil.rmtree(directory, ignore_errors=True)
             raise SessionExpiredError("Session is no longer authorized")
 
@@ -299,10 +367,8 @@ class SessionManager:
     async def stop_user_session(self, client) -> None:
         """Stop a transfer user client and delete its restored db directory."""
         directory = getattr(client, '_src_files_directory', None)
-        try:
-            await client.stop()
-        except Exception:
-            pass
+        if client:
+            await _stop_client(client)
         if directory:
             shutil.rmtree(directory, ignore_errors=True)
 

@@ -1,5 +1,4 @@
-pytdbot[tdjson]>=0.10.1
-tgcrypto
+pytdbot[tdjson]==0.10.1
 aiohttp
 python-dotenv
 uvloop
