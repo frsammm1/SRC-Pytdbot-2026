@@ -50,7 +50,14 @@ class TransferProgress:
         self.msg_id       = msg_id
 
         self._chat_id    = getattr(status_msg, 'chat_id', None)
-        self._message_id = getattr(status_msg, 'id', None)
+        raw_id           = getattr(status_msg, 'id', None)
+        # TDLib message ids are (server_id << 20); the Bot API needs the raw
+        # server id. Local/unsent ids (low 20 bits non-zero, or negative) can
+        # only be edited via TDLib — skip the PTB path for those.
+        if raw_id and raw_id > 0 and (raw_id & ((1 << 20) - 1)) == 0:
+            self._message_id = raw_id >> 20
+        else:
+            self._message_id = None
 
         self._start_time   = time.time()
         self._last_dl      = 0.0
@@ -115,18 +122,21 @@ class TransferProgress:
 
     async def _safe_edit(self, text: str):
         """Edit via PTB (HTTP Bot API); fall back to TDLib edit on failure."""
-        try:
-            ptb_bot = await config.get_ptb_bot()
-            await ptb_bot.edit_message_text(
-                chat_id=self._chat_id,
-                message_id=self._message_id,
-                text=text,
-            )
-        except Exception:
+        if self._message_id is not None:
             try:
-                await self.status_msg.edit_text(text)
+                ptb_bot = await config.get_ptb_bot()
+                await ptb_bot.edit_message_text(
+                    chat_id=self._chat_id,
+                    message_id=self._message_id,
+                    text=text,
+                )
+                return
             except Exception:
                 pass
+        try:
+            await self.status_msg.edit_text(text)
+        except Exception:
+            pass
 
 
 # ── TDLIB updateFile → TransferProgress BRIDGE ────────────────────────────────

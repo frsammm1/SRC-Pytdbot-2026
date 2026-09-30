@@ -517,26 +517,86 @@ async def robust_iter_messages(user_client, source_id, start_msg: int,
 async def td_download(client, message, dest_path: str, tracker=None) -> str:
     """
     Download a message's media via TDLib and place it at dest_path.
-    Returns dest_path. Raises on failure (Error, timeout, missing file).
+
+    Stall-resistant: instead of one blocking synchronous downloadFile call
+    (which can hang FOREVER on a TDLib-side stall), we start the download
+    asynchronously and poll downloaded_size every few seconds. If no bytes
+    arrive for DOWNLOAD_STALL_TIMEOUT seconds, the download is re-triggered
+    (TDLib resumes partial downloads). Raises after DOWNLOAD_MAX_ATTEMPTS.
+    Returns dest_path.
     """
     from pytdbot import types
 
     media_file = _media_file(message)
     file_id    = getattr(media_file, 'id', None)
-    if tracker and file_id is not None:
+    if file_id is None:
+        raise RuntimeError("message has no downloadable file")
+    if tracker:
         watch_file(file_id, tracker, 'download')
     try:
-        local = await message.download(priority=32, synchronous=True)
-        _raise_if_error(local, "(downloadFile)")
-        src_path = getattr(local, 'path', None)
-        if not src_path or not os.path.exists(src_path):
-            raise RuntimeError("downloadFile returned no local path")
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        if os.path.abspath(src_path) != os.path.abspath(dest_path):
-            shutil.copyfile(src_path, dest_path)
-        return dest_path
+        last_err = None
+        for attempt in range(1, config.DOWNLOAD_MAX_ATTEMPTS + 1):
+            try:
+                res = await client.downloadFile(
+                    file_id=file_id, priority=32, offset=0, limit=0,
+                    synchronous=False,
+                )
+                _raise_if_error(res, "(downloadFile)")
+
+                last_bytes    = -1
+                last_progress = time.time()
+                started       = time.time()
+                local         = None
+
+                while True:
+                    f = await client.getFile(file_id=file_id)
+                    _raise_if_error(f, "(getFile)")
+                    local = getattr(f, 'local', None)
+                    if getattr(local, 'is_downloading_completed', False):
+                        break
+                    cur = getattr(local, 'downloaded_size', 0) or 0
+                    if cur != last_bytes:
+                        last_bytes    = cur
+                        last_progress = time.time()
+                    elif time.time() - last_progress > config.DOWNLOAD_STALL_TIMEOUT:
+                        raise TimeoutError(
+                            f"download stalled at {cur} bytes for "
+                            f"{config.DOWNLOAD_STALL_TIMEOUT}s"
+                        )
+                    if time.time() - started > 7200:   # absolute cap per attempt
+                        raise TimeoutError("download exceeded 2h cap")
+                    await asyncio.sleep(5)
+
+                src_path = getattr(local, 'path', None)
+                if not src_path or not os.path.exists(src_path):
+                    raise RuntimeError("downloadFile completed but no local path")
+                os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
+                if os.path.abspath(src_path) != os.path.abspath(dest_path):
+                    shutil.copyfile(src_path, dest_path)
+                if attempt > 1:
+                    config.logger.info(f"✅ Download succeeded on attempt {attempt}")
+                return dest_path
+
+            except FloodWaitError:
+                raise
+            except Exception as e:
+                last_err = e
+                config.logger.warning(
+                    f"⚠️ Download attempt {attempt}/{config.DOWNLOAD_MAX_ATTEMPTS} "
+                    f"failed: {e} — re-triggering"
+                )
+                try:
+                    await client.cancelDownloadFile(
+                        file_id=file_id, only_if_pending=False
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(min(10 * attempt, 30))
+        raise RuntimeError(
+            f"download failed after {config.DOWNLOAD_MAX_ATTEMPTS} attempts: {last_err}"
+        )
     finally:
-        if tracker and file_id is not None:
+        if tracker:
             unwatch_file(file_id, tracker)
 
 
@@ -544,8 +604,11 @@ async def td_download_remote_id(client, remote_file_id: str, dest_path: str) -> 
     """Download any file by its TDLib remote file id (thumbnails etc.)."""
     f = await client.getRemoteFile(remote_file_id=remote_file_id)
     _raise_if_error(f, "(getRemoteFile)")
-    res = await client.downloadFile(
-        file_id=f.id, priority=32, offset=0, limit=0, synchronous=True
+    res = await asyncio.wait_for(
+        client.downloadFile(
+            file_id=f.id, priority=32, offset=0, limit=0, synchronous=True
+        ),
+        timeout=120,   # thumbnails are tiny — never let this hang a transfer
     )
     _raise_if_error(res, "(downloadFile)")
     src_path = getattr(getattr(res, 'local', None), 'path', None)

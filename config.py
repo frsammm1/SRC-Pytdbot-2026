@@ -82,6 +82,13 @@ UPLOAD_PROGRESS_INTERVAL   = 8   # seconds between upload progress edits
 PTB_SMALL_FILE_LIMIT  = 45  * 1024 * 1024    # 45 MB
 SPLIT_FILE_THRESHOLD  = 2 * 1024 * 1024 * 1024   # exactly 2 GiB — hardcoded per request
 
+# ── DOWNLOAD STALL PROTECTION ─────────────────────────────────────────────────
+# TDLib synchronous downloadFile can hang forever on a server-side stall, so
+# transfer.td_download polls downloaded_size and re-triggers the download when
+# no bytes arrive for DOWNLOAD_STALL_TIMEOUT seconds.
+DOWNLOAD_STALL_TIMEOUT = 180   # seconds without progress → cancel & retry
+DOWNLOAD_MAX_ATTEMPTS  = 4     # download attempts before giving up on a file
+
 # ── UPLOAD STALL TIMEOUT ───────────────────────────────────────────────────────
 UPLOAD_TIMEOUT_FLOOR_SECONDS      = 600            # minimum timeout per attempt (10 min)
 UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC = 200 * 1024    # assume ≥200 KB/s or it's genuinely stalled
