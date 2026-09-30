@@ -99,7 +99,8 @@ async def main():
     # threads"). So ALL clients in this process (bot + temp login clients +
     # in-process transfer user clients) live on ONE shared ClientManager.
     from pytdbot import Client, ClientManager
-    from session_manager import session_manager, wait_until_ready
+    import session_manager
+    from session_manager import wait_until_ready
 
     bot_client = Client(
         token=config.BOT_TOKEN,

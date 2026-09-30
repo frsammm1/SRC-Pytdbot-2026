@@ -290,10 +290,11 @@ async def main(user_id: int, task_id: str):
     # SIGABRT the whole dyno). Manager created with a LIST so stopping a
     # managed client never closes the manager itself.
     from pytdbot import ClientManager
+    import session_manager as session_manager_mod
     from session_manager import wait_until_ready
 
     client_manager = ClientManager([], verbosity=1, loop=asyncio.get_running_loop())
-    session_manager.set_client_manager(client_manager)
+    session_manager_mod.set_client_manager(client_manager)
     await client_manager.start()
 
     bot_client = make_bot_client("worker_bot")
