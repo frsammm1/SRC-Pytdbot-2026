@@ -118,6 +118,7 @@ async def auto_resume_stale_tasks() -> None:
                 'topic_id':      checkpoint.get('topic_id'),
                 'dest_topic_id': checkpoint.get('dest_topic_id'),
                 'settings':      checkpoint.get('settings', {}),
+                'start_link':    checkpoint.get('source_link'),
             }
             await db.create_transfer_task(new_task_id, user_id, task_data)
             dyno_data = await heroku_manager.spawn_user_dyno(user_id, new_task_id)

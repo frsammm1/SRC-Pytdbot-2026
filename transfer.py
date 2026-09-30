@@ -128,21 +128,137 @@ def _raise_if_error(res, context: str = ""):
 
 
 # ── CHAT RESOLUTION ───────────────────────────────────────────────────────────
+#
+# ⚠️ TDLib PITFALL (the "Could not access the source channel/group" bug):
+# getChat() is, for user accounts, an OFFLINE lookup — it only knows chats the
+# local TDLib instance has already seen. Our transfer sessions are restored
+# fresh from a tiny archived db (use_chat_info_database=False), so TDLib knows
+# ZERO chats and getChat(-100…) fails with "400: Chat not found" even when the
+# logged-in account IS a member of the chat (TDLib issue #2344).
+#
+# Fix ladder implemented by resolve_source_chat():
+#   1. getChat()                      — fast path (warm cache)
+#   2. getMessageLinkInfo(link)       — the SAME call official apps make when a
+#      message link is tapped; resolves t.me/c/… links SERVER-side and loads
+#      the chat into TDLib as a side effect. Works for private chats the local
+#      instance has never seen.
+#   3. getChats() with growing limits — makes TDLib stream the account's real
+#      chat list from the server into the local cache, then retry getChat().
 
-async def _resolve_chat_id(client, source) -> int:
+async def _try_get_chat(client, chat_id: int):
+    """getChat() that returns the Chat on success, None otherwise."""
+    try:
+        chat = await client.getChat(chat_id=chat_id)
+        if not config.is_error(chat):
+            return chat
+    except Exception:
+        pass
+    return None
+
+
+async def _resolve_via_link(client, link: str):
     """
-    Resolve a source identifier (numeric -100… id or public @username) to a
-    TDLib chat_id. Pyrogram's get_chat() accepted both; TDLib needs
-    searchPublicChat for usernames.
+    Resolve a t.me message link through TDLib itself (server-side).
+    Returns (chat_id, forum_topic_id) — either may be None.
     """
-    if isinstance(source, int) or (isinstance(source, str) and source.lstrip('-').isdigit()):
-        chat = await client.getChat(chat_id=int(source))
-        _raise_if_error(chat, f"(resolve {source})")
-        return int(source)
-    username = str(source).lstrip('@')
-    chat = await client.searchPublicChat(username=username)
-    _raise_if_error(chat, f"(resolve @{username})")
-    return chat.id
+    if not link:
+        return None, None
+    try:
+        info = await client.getMessageLinkInfo(url=link.strip())
+    except Exception as e:
+        config.logger.warning(f"getMessageLinkInfo({link!r}) failed: {e}")
+        return None, None
+    if config.is_error(info):
+        config.logger.warning(
+            f"getMessageLinkInfo({link!r}) → TDLib error: {config.err_text(info)}"
+        )
+        return None, None
+    chat_id  = getattr(info, 'chat_id', 0) or None
+    topic    = getattr(info, 'topic_id', None)
+    topic_id = None
+    if _cname(topic) == 'MessageTopicForum':
+        topic_id = getattr(topic, 'forum_topic_id', None)
+    return chat_id, topic_id
+
+
+async def _load_chat_list(client, max_chats: int = 8000) -> None:
+    """
+    Stream the account's main (and archive) chat lists into TDLib's in-memory
+    cache so getChat() can find them. Doubles the limit each round until the
+    list is exhausted or max_chats is reached.
+    """
+    from pytdbot import types
+    for chat_list in (types.ChatListMain(), types.ChatListArchive()):
+        limit = 200
+        while limit <= max_chats:
+            try:
+                res = await client.getChats(chat_list=chat_list, limit=limit)
+                if config.is_error(res):
+                    break
+                ids = getattr(res, 'chat_ids', None) or []
+                if len(ids) < limit:
+                    break                       # list exhausted
+            except Exception:
+                break
+            limit *= 2
+            await asyncio.sleep(0.3)
+
+
+async def resolve_source_chat(client, source, link: str = None):
+    """
+    Robustly resolve a source identifier (numeric -100… id or @username) to a
+    TDLib Chat object — works even on a FRESH session that has never seen the
+    chat. Raises the legacy-friendly exception if genuinely inaccessible.
+    """
+    # ── Public username ───────────────────────────────────────────────────
+    if isinstance(source, str) and not source.lstrip('-').isdigit():
+        username = source.lstrip('@')
+        chat = await client.searchPublicChat(username=username)
+        _raise_if_error(chat, f"(resolve @{username})")
+        return chat
+
+    chat_id = int(source)
+
+    # ── 1. Warm cache fast path ───────────────────────────────────────────
+    chat = await _try_get_chat(client, chat_id)
+    if chat:
+        return chat
+    config.logger.info(f"resolve: getChat({chat_id}) cold — trying link resolution…")
+
+    # ── 2. Server-side resolution through the original message link ───────
+    link_chat, link_topic = await _resolve_via_link(client, link)
+    if link_topic:
+        config.logger.info(f"resolve: link confirms forum topic {link_topic}")
+    if link_chat:
+        if link_chat != chat_id:
+            # e.g. a channel COMMENT link — the message actually lives in the
+            # linked discussion group. Trust TDLib's chat_id.
+            config.logger.info(
+                f"resolve: link points to chat {link_chat} (parsed {chat_id}) — using TDLib's"
+            )
+        chat = await _try_get_chat(client, link_chat)
+        if chat:
+            config.logger.info(f"✅ resolve: link resolution OK ({getattr(chat, 'title', chat.id)!r})")
+            return chat
+        # getMessageLinkInfo already proved server-side access and loaded the
+        # chat — even if getChat still hiccups, the id itself is usable for
+        # getMessages(); degrade to a minimal stand-in instead of failing.
+        from types import SimpleNamespace
+        config.logger.info("✅ resolve: using link-resolved chat id directly")
+        return SimpleNamespace(id=link_chat, title=str(link_chat))
+
+    # ── 3. Pull the account's chat list into cache, then retry ────────────
+    config.logger.info("resolve: loading account chat list from server…")
+    await _load_chat_list(client)
+    chat = await _try_get_chat(client, chat_id)
+    if chat:
+        config.logger.info(f"✅ resolve: found after chat-list load ({getattr(chat, 'title', chat.id)!r})")
+        return chat
+
+    # ── Genuinely inaccessible — surface TDLib's own error text ───────────
+    final = await client.getChat(chat_id=chat_id)
+    _raise_if_error(final, f"(resolve {source})")
+    return final
 
 
 # ── PREFLIGHT CHECK ───────────────────────────────────────────────────────────
@@ -168,13 +284,14 @@ async def _preflight_check(bot_client, dest_id) -> tuple:
 # ── ROBUST MESSAGE ITERATION (TDLib getMessages) ──────────────────────────────
 
 async def robust_iter_messages(user_client, source_id, start_msg: int,
-                                end_msg: int, topic_id=None):
+                                end_msg: int, topic_id=None, source_link=None):
     """
     Async generator — yields pytdbot Messages from [start_msg, end_msg].
     Uses getMessages(chat_id, ids=[list]) in batches of 200 IDs.
     Topic-filtered client-side via _is_in_topic().
     """
-    source_id = await _resolve_chat_id(user_client, source_id)
+    chat      = await resolve_source_chat(user_client, source_id, link=source_link)
+    source_id = chat.id
 
     current     = start_msg
     zero_misses = 0
@@ -214,7 +331,7 @@ async def robust_iter_messages(user_client, source_id, start_msg: int,
                         f"{MAX_CONN_RETRIES} attempts: {e}"
                     )
                 try:
-                    await user_client.getChat(chat_id=source_id)
+                    await resolve_source_chat(user_client, source_id, link=source_link)
                 except Exception:
                     pass
                 await asyncio.sleep(3 * conn_retries)
@@ -608,6 +725,7 @@ async def transfer_process(
     log_channel=None,
     topic_id=None,
     dest_topic_id=None,
+    source_link=None,
 ):
     from session_manager import SessionExpiredError
 
@@ -639,6 +757,29 @@ async def transfer_process(
         await safe_edit_message(status_message, preflight_err)
         config.active_sessions.pop(session_id, None)
         return 'stopped_errors', config.RETRY_AFTER_FAILURE_SECONDS
+
+    # ── STEP 0a: SOURCE preflight on the user client ──────────────────────────
+    # Resolve BEFORE scanning so a genuinely inaccessible source gives the
+    # clear "could not access" message instead of a generic crash + retries.
+    try:
+        src_chat  = await resolve_source_chat(user_client, source_id, link=source_link)
+        source_id = src_chat.id
+        config.logger.info(
+            f"✅ Source preflight OK: {getattr(src_chat, 'title', source_id)!r} ({source_id})"
+        )
+    except FloodWaitError as e:
+        config.logger.warning(f"Source preflight FloodWait {e.x}s — waiting…")
+        await asyncio.sleep(e.x + 2)
+    except Exception as e:
+        await safe_edit_message(
+            status_message,
+            "❌ **Could not access the source channel/group.**\n\n"
+            "Make sure your logged-in account is a member of the source chat, "
+            "then run `/clone` again.\n\n"
+            f"`{str(e)[:150]}`"
+        )
+        config.active_sessions.pop(session_id, None)
+        return 'stopped_source', None
 
     # ── STEP 0b: PTB Bot singleton ────────────────────────────────────────────
     try:
@@ -760,6 +901,7 @@ async def transfer_process(
                 'dest_topic_id':  dest_topic_id,
                 'log_channel':    log_channel,
                 'task_id':        task_id,
+                'source_link':    source_link,
                 'total_success':  total_success,
                 'total_skipped':  total_skipped,
                 'total_size':     total_size,
@@ -784,7 +926,8 @@ async def transfer_process(
                                 reply_markup=get_progress_keyboard())
 
         async for message in robust_iter_messages(
-            user_client, source_id, effective_start_msg, end_msg, topic_id
+            user_client, source_id, effective_start_msg, end_msg, topic_id,
+            source_link=source_link,
         ):
             if await _should_stop():
                 stop_reason = 'user_stop'

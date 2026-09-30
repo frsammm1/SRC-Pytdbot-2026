@@ -1388,10 +1388,11 @@ def register_handlers(bot_client):
                     "(t.me, telegram.me, telegram.dog — teeno chalenge)"
                 )
                 return
-            session['source']    = source
-            session['start_msg'] = msg_id
-            session['topic_id']  = topic_id
-            session['step']      = 'wait_end_link'
+            session['source']     = source
+            session['start_msg']  = msg_id
+            session['topic_id']   = topic_id
+            session['start_link'] = link
+            session['step']       = 'wait_end_link'
             topic_notice = f"\nTopic: `{topic_id}`" if topic_id else ""
             await _reply(message,
                 f"Start point set — msg `{msg_id}`{topic_notice}\n\n"
@@ -1413,8 +1414,9 @@ def register_handlers(bot_client):
             if msg_id < session['start_msg']:
                 await _reply(message, "❌ Last message, first message se pehle ka nahi ho sakta!")
                 return
-            session['end_msg'] = msg_id
-            session['step']    = 'wait_dest_input'
+            session['end_msg']  = msg_id
+            session['end_link'] = link
+            session['step']     = 'wait_dest_input'
             if end_topic and not session.get('topic_id'):
                 session['topic_id'] = end_topic
             total_msgs = session['end_msg'] - session['start_msg'] + 1
@@ -1980,6 +1982,8 @@ def register_handlers(bot_client):
                     'topic_id':      session.get('topic_id'),
                     'dest_topic_id': dest_topic_id,
                     'settings':      session.get('settings', {}),
+                    'start_link':    session.get('start_link'),
+                    'end_link':      session.get('end_link'),
                 }
                 await db.cancel_all_active_tasks(user_id)
                 await db.create_transfer_task(task_id, user_id, task_data)
@@ -2019,6 +2023,7 @@ def register_handlers(bot_client):
                         log_channel=int(log_channel) if log_channel else None,
                         topic_id=session.get('topic_id'),
                         dest_topic_id=dest_topic_id,
+                        source_link=session.get('start_link'),
                     )
                 )
             except Exception as e:
@@ -2090,6 +2095,7 @@ def register_handlers(bot_client):
             topic_id    = checkpoint.get('topic_id')
             log_channel = checkpoint.get('log_channel')
             settings    = checkpoint.get('settings', {'fname_rules': [], 'cap_rules': []})
+            source_link = checkpoint.get('source_link')
 
             if start_msg > end_msg:
                 await _safe_cb_edit(query, "Transfer was already complete. Checkpoint cleared.")
@@ -2120,6 +2126,7 @@ def register_handlers(bot_client):
                     'topic_id':      topic_id,
                     'dest_topic_id': dest_topic_id,
                     'settings':      settings,
+                    'start_link':    source_link,
                 }
                 await db.cancel_all_active_tasks(user_id)
                 await db.create_transfer_task(task_id, user_id, task_data)
@@ -2149,6 +2156,7 @@ def register_handlers(bot_client):
                         log_channel=int(log_channel) if log_channel else None,
                         topic_id=topic_id,
                         dest_topic_id=dest_topic_id,
+                        source_link=source_link,
                     )
                 )
             except Exception as e:

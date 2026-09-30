@@ -38,7 +38,7 @@ import psutil
 import config
 import database as db
 from transfer import transfer_process, _raise_if_error
-from session_manager import session_manager, SessionExpiredError
+from session_manager import session_manager, SessionExpiredError, FloodWaitError
 import progress as progress_mod
 
 logging.basicConfig(
@@ -61,7 +61,7 @@ DYNO_RAM_LIMITS = {
 }
 
 def get_dyno_ram_limit() -> int:
-    size = os.environ.get("WORKER_DYNO_SIZE", "standard-1x").lower().strip()
+    size = os.environ.get("WORKER_DYNO_SIZE", "basic").lower().strip()
     return DYNO_RAM_LIMITS.get(size, 512 * 1024 * 1024)
 
 
@@ -214,25 +214,27 @@ async def worker_preflight(bot_client, dest_id, chat_id: int) -> bool:
         return True
 
 
-async def worker_preflight_source(user_client, source_id, chat_id: int, bot_client) -> bool:
+async def worker_preflight_source(user_client, source_id, chat_id: int, bot_client,
+                                  source_link=None) -> bool:
     """
     Resolve the SOURCE chat on the user client before any getMessages() call.
     Returns True if OK, False if the source is genuinely inaccessible.
+
+    Uses transfer.resolve_source_chat() — getChat() alone fails on a fresh
+    TDLib session ("Chat not found") even for chats the account belongs to,
+    so the original t.me link is resolved server-side via getMessageLinkInfo
+    and the account's chat list is streamed in as a fallback.
     """
+    from transfer import resolve_source_chat
     logger.info(f"🔍 Worker preflight: resolving source peer {source_id}…")
     try:
-        if isinstance(source_id, str) and not source_id.lstrip('-').isdigit():
-            chat = await user_client.searchPublicChat(username=source_id.lstrip('@'))
-        else:
-            chat = await user_client.getChat(chat_id=int(source_id))
-        if config.is_error(chat):
-            retry = config.get_retry_after(chat)
-            if retry:
-                logger.warning(f"Source preflight FloodWait {retry}s — waiting…")
-                await asyncio.sleep(retry + 2)
-                return True
-            raise Exception(chat.message)
+        chat = await resolve_source_chat(user_client, source_id, link=source_link)
         logger.info(f"✅ Source preflight OK: {getattr(chat, 'title', chat.id)!r}")
+        return True
+
+    except FloodWaitError as e:
+        logger.warning(f"Source preflight FloodWait {e.x}s — waiting…")
+        await asyncio.sleep(e.x + 2)
         return True
 
     except Exception as e:
@@ -367,7 +369,8 @@ async def main(user_id: int, task_id: str):
 
     # ── Worker preflight: resolve SOURCE peer ──────────────────────────────
     source_preflight_ok = await worker_preflight_source(
-        user_client, task_data['source_id'], chat_id, bot_client
+        user_client, task_data['source_id'], chat_id, bot_client,
+        source_link=task_data.get('start_link') or task_data.get('source_link'),
     )
     if not source_preflight_ok:
         await db.update_task_status(task_id, 'failed')
@@ -404,6 +407,7 @@ async def main(user_id: int, task_id: str):
             log_channel   = task_data.get('log_channel'),
             topic_id      = task_data.get('topic_id'),
             dest_topic_id = dest_topic_id,
+            source_link   = task_data.get('start_link') or task_data.get('source_link'),
         )
 
         if result == 'completed':
@@ -412,6 +416,11 @@ async def main(user_id: int, task_id: str):
         elif result == 'stopped_by_user':
             await db.update_task_status(task_id, 'stop_requested')
             logger.info(f"🚫 Transfer stopped by user/admin for user {user_id}")
+        elif result == 'stopped_source':
+            # Source genuinely inaccessible (user not a member etc.) —
+            # retrying would never succeed, so fail terminally.
+            await db.update_task_status(task_id, 'failed')
+            logger.warning(f"❌ Source inaccessible for user {user_id} — task failed (no retry)")
         else:
             # Retryable — the watchdog auto-spawns a fresh dyno from the
             # exact last checkpoint after the computed backoff.

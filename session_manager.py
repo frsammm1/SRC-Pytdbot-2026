@@ -303,6 +303,10 @@ class SessionManager:
         blob = None
         try:
             if client:
+                # Let pytdbot's internal post-login getMe() finish BEFORE we
+                # close the client — otherwise it logs a noisy (harmless)
+                # "'Error' object has no attribute 'first_name'" task crash.
+                await asyncio.sleep(1.5)
                 await _stop_client(client)
             if directory and os.path.isdir(directory):
                 # TDLib flushes td.binlog asynchronously on close — give it a beat.

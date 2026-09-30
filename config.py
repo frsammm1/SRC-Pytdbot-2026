@@ -34,7 +34,7 @@ PORT      = int(os.environ.get("PORT", 8080))
 # ── HEROKU ────────────────────────────────────────────────────────────────────
 HEROKU_API_TOKEN = os.environ.get("HEROKU_API_TOKEN")
 HEROKU_APP_NAME  = os.environ.get("HEROKU_APP_NAME")
-WORKER_DYNO_SIZE = os.environ.get("WORKER_DYNO_SIZE", "standard-1x")
+WORKER_DYNO_SIZE = os.environ.get("WORKER_DYNO_SIZE", "basic").lower().strip()
 
 # ── TDLIB ─────────────────────────────────────────────────────────────────────
 # A single fixed encryption key so a TDLib database archived on one dyno can be

@@ -18,8 +18,12 @@ HEROKU_APP_NAME  = os.environ.get("HEROKU_APP_NAME", "")
 HEROKU_API_BASE  = "https://api.heroku.com"
 
 # Dyno size to use for each user worker.
-# "standard-1x" → 512 MB RAM.  "standard-2x" → 1 GB RAM.
-WORKER_DYNO_SIZE = os.environ.get("WORKER_DYNO_SIZE", "standard-1x")
+# "basic" → 512 MB RAM (works on every app tier).
+# NOTE: Heroku size names are case-sensitive lowercase. If the configured
+# size is above the app's dyno tier (e.g. "Standard-2X" on a Basic-tier app)
+# the API rejects the spawn with 422 — spawn_user_dyno() then automatically
+# falls back to "basic" so transfers never die on a tier mismatch.
+WORKER_DYNO_SIZE = os.environ.get("WORKER_DYNO_SIZE", "basic").lower().strip()
 
 
 class HerokuManager:
@@ -46,15 +50,14 @@ class HerokuManager:
             logger.error("HEROKU_API_TOKEN / HEROKU_APP_NAME not set!")
             return {}
 
-        payload = {
-            "command": f"python3 worker.py --user-id={user_id} --task-id={task_id}",
-            "attach":  False,
-            "size":    WORKER_DYNO_SIZE,
-            "env":     {},          # inherits app config vars automatically
-            "time_to_live": 86400,  # 24-hour safety cap
-        }
-
-        try:
+        async def _spawn_with_size(size: str):
+            payload = {
+                "command": f"python3 worker.py --user-id={user_id} --task-id={task_id}",
+                "attach":  False,
+                "size":    size,
+                "env":     {},          # inherits app config vars automatically
+                "time_to_live": 86400,  # 24-hour safety cap
+            }
             async with aiohttp.ClientSession() as s:
                 resp = await s.post(
                     self._url("/dynos"),
@@ -62,10 +65,23 @@ class HerokuManager:
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=30),
                 )
-                data = await resp.json()
+                return resp.status, await resp.json()
 
-            if resp.status not in (200, 201, 202):
-                logger.error(f"Heroku spawn failed ({resp.status}): {data}")
+        try:
+            status, data = await _spawn_with_size(WORKER_DYNO_SIZE)
+
+            # 422 invalid_params → the requested size is above the app's dyno
+            # tier (e.g. Standard-2X configured, app limited to Basic). Retry
+            # once with "basic" — available on every tier.
+            if status == 422 and WORKER_DYNO_SIZE != "basic":
+                logger.warning(
+                    f"Dyno size '{WORKER_DYNO_SIZE}' rejected (422) — "
+                    f"retrying with 'basic'…"
+                )
+                status, data = await _spawn_with_size("basic")
+
+            if status not in (200, 201, 202):
+                logger.error(f"Heroku spawn failed ({status}): {data}")
                 return {}
 
             logger.info(f"✅ Spawned dyno '{data.get('name')}' for user {user_id}")
