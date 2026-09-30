@@ -85,8 +85,31 @@ async def safe_edit_message(message, text: str, reply_markup=None):
     asyncio.create_task(_edit())
 
 
+# ── TDLIB MESSAGE-ID ENCODING ────────────────────────────────────────────────
+# TDLib encodes server (MTProto / t.me link) message ids by left-shifting 20
+# bits: td_id = server_id << 20 (see MessageId::SERVER_ID_SHIFT in TDLib).
+# Raw link ids (e.g. 1232) are NOT valid TDLib message ids — passing them to
+# getMessages() fails with "400 Invalid message identifier" because the low 20
+# bits must be zero for server messages. All link-parsed ids in this module
+# therefore stay in the SERVER domain (exactly like the old PyroFork flow);
+# conversion happens only at TDLib call boundaries, and every yielded message
+# has its .id normalized back to the server domain.
+# NOTE: forum topic ids (MessageTopicForum.forum_topic_id) are NOT shifted —
+# TDLib returns them raw (verified live: topic 1228 stays 1228).
+_TD_ID_SHIFT = 20
+
+def _td_msg_id(server_id: int) -> int:
+    """Server (t.me link) message id → TDLib message id."""
+    return int(server_id) << _TD_ID_SHIFT
+
+def _srv_msg_id(td_id: int) -> int:
+    """TDLib message id → server (t.me link) message id."""
+    return int(td_id) >> _TD_ID_SHIFT
+
+
 def _is_in_topic(msg, topic_id: int) -> bool:
-    """Return True if a TDLib message belongs to the given forum topic."""
+    """Return True if a TDLib message belongs to the given forum topic.
+    Expects msg.id already normalized to the server domain."""
     if msg.id == topic_id:
         return True
     t = getattr(msg, 'topic_id', None)
@@ -281,18 +304,126 @@ async def _preflight_check(bot_client, dest_id) -> tuple:
         return True, None
 
 
-# ── ROBUST MESSAGE ITERATION (TDLib getMessages) ──────────────────────────────
+# ── ROBUST MESSAGE ITERATION (TDLib getMessages / getForumTopicHistory) ───────
+
+async def _fetch_topic_page(user_client, chat_id, topic_id, anchor_td):
+    """
+    Fetch one forward page of a forum topic via getForumTopicHistory.
+    anchor_td is a TDLib-domain message id (server_id << 20). Handles
+    FloodWait, transient errors, and deleted-anchor walk-back (up to 100
+    server ids). Returns the raw TDLib result.
+    """
+    MAX_CONN_RETRIES = 5
+    conn_retries = 0
+    walkbacks    = 0
+    while True:
+        try:
+            res = await user_client.getForumTopicHistory(
+                chat_id=chat_id,
+                forum_topic_id=int(topic_id),
+                from_message_id=anchor_td,
+                offset=-99,          # anchor + up to 99 NEWER messages
+                limit=100,
+            )
+            if config.is_error(res):
+                retry = config.get_retry_after(res)
+                if retry:
+                    raise FloodWaitError(retry)
+                emsg = (getattr(res, 'message', '') or '')
+                eup  = emsg.upper()
+                if 'MESSAGE' in eup and ('NOT FOUND' in eup or 'INVALID' in eup):
+                    # Anchor message was deleted — step back one server id
+                    if walkbacks < 100:
+                        walkbacks += 1
+                        anchor_td -= (1 << _TD_ID_SHIFT)
+                        continue
+                    raise Exception(
+                        "Couldn't locate any message near the start of your "
+                        "range in this topic — the first ~100 messages of the "
+                        "range may be deleted. Try a later start link."
+                    )
+                _raise_if_error(res, "(getForumTopicHistory)")
+            return res
+        except FloodWaitError as e:
+            wait = e.x + 2
+            config.logger.warning(f"FloodWait {e.x}s during topic scan — waiting {wait}s")
+            await asyncio.sleep(wait)
+        except Exception as e:
+            from session_manager import SessionExpiredError
+            if isinstance(e, SessionExpiredError):
+                raise Exception(
+                    "⚠️ User session expired during transfer.\n"
+                    "Please use /login to reconnect and try again."
+                )
+            if "Couldn't locate" in str(e):
+                raise
+            conn_retries += 1
+            config.logger.error(f"getForumTopicHistory error (attempt {conn_retries}): {e}")
+            if conn_retries > MAX_CONN_RETRIES:
+                raise Exception(f"Too many errors fetching topic messages: {e}")
+            await asyncio.sleep(5 * conn_retries)
+
 
 async def robust_iter_messages(user_client, source_id, start_msg: int,
                                 end_msg: int, topic_id=None, source_link=None):
     """
-    Async generator — yields pytdbot Messages from [start_msg, end_msg].
-    Uses getMessages(chat_id, ids=[list]) in batches of 200 IDs.
-    Topic-filtered client-side via _is_in_topic().
+    Async generator — yields pytdbot Messages in [start_msg, end_msg].
+
+    start_msg/end_msg are SERVER-domain ids (as parsed from t.me links — same
+    semantics as the old PyroFork flow). TDLib ids (server_id << 20) are used
+    only at TDLib call boundaries; every yielded message has .id normalized
+    back to the server domain so ranges, checkpoints, topic filters and
+    user-facing progress behave exactly like the PyroFork version.
+
+    Topic mode walks the topic natively via getForumTopicHistory (robust
+    whether TDLib numbers topic messages per-topic or channel-wide, and far
+    more efficient than scanning the whole channel). Non-topic mode batches
+    getMessages with shifted ids.
     """
     chat      = await resolve_source_chat(user_client, source_id, link=source_link)
     source_id = chat.id
 
+    # ── FORUM TOPIC MODE ──────────────────────────────────────────────────
+    if topic_id is not None:
+        anchor_td    = _td_msg_id(start_msg)
+        last_td      = anchor_td - (1 << _TD_ID_SHIFT)
+        zero_misses  = 0
+        while True:
+            res  = await _fetch_topic_page(user_client, source_id, topic_id, anchor_td)
+            msgs = sorted([m for m in (getattr(res, 'messages', None) or []) if m],
+                          key=lambda m: m.id)
+            new_msgs = [m for m in msgs if m.id > last_td]
+
+            if not new_msgs:
+                zero_misses += 1
+                if zero_misses >= config.ZERO_PROGRESS_RETRIES:
+                    config.logger.warning(
+                        f"iter(topic): {config.ZERO_PROGRESS_RETRIES} empty pages "
+                        f"at server-id {_srv_msg_id(anchor_td)}. Concluding done."
+                    )
+                    return
+                delay = config.ZERO_PROGRESS_DELAYS[
+                    min(zero_misses - 1, len(config.ZERO_PROGRESS_DELAYS) - 1)
+                ]
+                await asyncio.sleep(delay)
+                continue
+
+            zero_misses = 0
+            for msg in new_msgs:
+                last_td = msg.id
+                msg.id  = _srv_msg_id(msg.id)        # → server domain
+                if msg.id < start_msg:
+                    continue
+                if msg.id > end_msg:
+                    return
+                if not _is_in_topic(msg, topic_id):  # safety net for channel-wide id spaces
+                    continue
+                yield msg
+
+            anchor_td = last_td
+            await asyncio.sleep(1)
+
+    # ── REGULAR CHANNEL/GROUP MODE ────────────────────────────────────────
     current     = start_msg
     zero_misses = 0
     MAX_CONN_RETRIES = 5
@@ -300,7 +431,7 @@ async def robust_iter_messages(user_client, source_id, start_msg: int,
 
     while current <= end_msg:
         batch_end = min(current + GET_MESSAGES_BATCH - 1, end_msg)
-        ids       = list(range(current, batch_end + 1))
+        ids       = [_td_msg_id(i) for i in range(current, batch_end + 1)]
 
         try:
             res = await user_client.getMessages(chat_id=source_id, message_ids=ids)
@@ -349,6 +480,7 @@ async def robust_iter_messages(user_client, source_id, start_msg: int,
         sorted_msgs    = sorted([m for m in raw_msgs if m], key=lambda m: m.id)
 
         for msg in sorted_msgs:
+            msg.id = _srv_msg_id(msg.id)             # → server domain
             if msg.id < start_msg or msg.id > end_msg:
                 continue
             if topic_id is not None and not _is_in_topic(msg, topic_id):
@@ -1014,7 +1146,10 @@ async def transfer_process(
                         res = await user_client.forwardMessages(
                             chat_id=dest_id,
                             from_chat_id=message.chat_id,
-                            message_ids=[message.id],
+                            # message.id is server-domain here (normalized by
+                            # robust_iter_messages) — forwardMessages needs the
+                            # TDLib-domain id:
+                            message_ids=[_td_msg_id(message.id)],
                             send_copy=True,
                             **_topic_kw(dest_topic_id),
                         )
