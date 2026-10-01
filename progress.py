@@ -28,6 +28,12 @@ import config
 from utils import human_readable_size, time_formatter
 
 
+# Only the LATEST tracker for a given status message is allowed to edit it.
+# Previous-file in-flight edits used to win the race and freeze the bar on
+# an old filename while the current download/upload kept going.
+_status_owners: dict = {}   # (chat_id, raw_status_id) → TransferProgress
+
+
 class TransferProgress:
     """
     Progress tracker for a single file's download + upload phases.
@@ -51,6 +57,7 @@ class TransferProgress:
 
         self._chat_id    = getattr(status_msg, 'chat_id', None)
         raw_id           = getattr(status_msg, 'id', None)
+        self._raw_id     = raw_id
         # TDLib message ids are (server_id << 20); the Bot API needs the raw
         # server id. Local/unsent ids (low 20 bits non-zero, or negative) can
         # only be edited via TDLib — skip the PTB path for those.
@@ -63,35 +70,66 @@ class TransferProgress:
         self._last_dl      = 0.0
         self._last_ul      = 0.0
         self._phase        = "download"
+        self._alive        = True
+        self._seq          = 0
+        self._lock         = asyncio.Lock()
+
+        owner_key = (self._chat_id, raw_id)
+        prev = _status_owners.get(owner_key)
+        if prev is not None and prev is not self:
+            prev.invalidate()
+        _status_owners[owner_key] = self
 
     # ── PUBLIC API ────────────────────────────────────────────────────────────
 
+    def invalidate(self):
+        """Stop this tracker from editing the status message (next file owns it)."""
+        self._alive = False
+        self._seq  += 1
+        key = (self._chat_id, self._raw_id)
+        if _status_owners.get(key) is self:
+            _status_owners.pop(key, None)
+
     async def download_cb(self, current: int, total: int, force: bool = False):
+        if not self._alive:
+            return
+        # A late updateFile after reset_for_upload must NOT flip the bar
+        # back to "Downloading" (that's the frozen-on-old-frame bug).
+        if self._phase == "upload":
+            return
         now = time.time()
         if not force and now - self._last_dl < config.DOWNLOAD_PROGRESS_INTERVAL:
             return
         self._last_dl = now
         self._phase   = "download"
         text = self._build_text(current, total)
-        asyncio.create_task(self._safe_edit(text))
+        self._seq += 1
+        asyncio.create_task(self._safe_edit(text, self._seq))
 
     async def upload_cb(self, current: int, total: int, force: bool = False):
+        if not self._alive:
+            return
         now = time.time()
         if not force and now - self._last_ul < config.UPLOAD_PROGRESS_INTERVAL:
             return
         self._last_ul = now
         self._phase   = "upload"
         text = self._build_text(current, total)
-        asyncio.create_task(self._safe_edit(text))
+        self._seq += 1
+        asyncio.create_task(self._safe_edit(text, self._seq))
 
     def reset_for_upload(self):
         """Switch to the upload phase and IMMEDIATELY show an upload bar so
         the status never looks stuck on the last download frame."""
+        if not self._alive:
+            return
         self._start_time = time.time()
         self._last_ul    = 0.0
         self._phase      = "upload"
+        # Bump seq FIRST so any in-flight "Downloading 100%" edit is dropped.
+        self._seq       += 1
         text = self._build_text(0, self.file_size)
-        asyncio.create_task(self._safe_edit(text))
+        asyncio.create_task(self._safe_edit(text, self._seq))
 
     # ── INTERNAL ──────────────────────────────────────────────────────────────
 
@@ -100,7 +138,7 @@ class TransferProgress:
         elapsed = time.time() - self._start_time
         speed   = current / elapsed if elapsed > 0 else 0
         eta     = (total - current) / speed if speed > 0 else 0
-        pct     = min(100.0, current * 100 / total)
+        pct     = min(100.0, current * 100 / total) if total else 0.0
         filled  = math.floor(pct / 100 * 12)
         bar     = "▓" * filled + "░" * (12 - filled)
 
@@ -111,7 +149,7 @@ class TransferProgress:
             icon  = "📤"
             label = "Uploading"
 
-        name = self.file_name or "file"
+        name = (self.file_name or "file").replace("`", "'")
         name_display = (name[:38] + "…") if len(name) > 38 else name
 
         msg_line = f" • #{self.msg_id}" if self.msg_id else ""
@@ -124,24 +162,47 @@ class TransferProgress:
             f"⚡`{human_readable_size(speed)}/s`  ⏱`{time_formatter(eta)}`"
         )
 
-    async def _safe_edit(self, text: str):
-        """Edit via PTB (HTTP Bot API); fall back to TDLib edit on failure."""
-        if self._message_id is not None:
-            try:
-                ptb_bot = await config.get_ptb_bot()
-                await ptb_bot.edit_message_text(
-                    chat_id=self._chat_id,
-                    message_id=self._message_id,
-                    text=text,
-                    parse_mode="markdown",
-                )
+    async def _safe_edit(self, text: str, seq: int = 0):
+        """Edit via PTB (HTTP Bot API); fall back to TDLib edit on failure.
+
+        `seq` drops stale in-flight edits so an older file can never overwrite
+        the current progress bar.
+        """
+        if not self._alive or (seq and seq != self._seq):
+            return
+        async with self._lock:
+            if not self._alive or (seq and seq != self._seq):
                 return
-            except Exception:
-                pass
-        try:
-            await self.status_msg.edit_text(text, parse_mode="markdown")
-        except Exception:
-            pass
+            edited = False
+            if self._message_id is not None:
+                try:
+                    ptb_bot = await config.get_ptb_bot()
+                    if not self._alive or (seq and seq != self._seq):
+                        return
+                    await ptb_bot.edit_message_text(
+                        chat_id=self._chat_id,
+                        message_id=self._message_id,
+                        text=text,
+                        parse_mode="markdown",
+                    )
+                    edited = True
+                except Exception:
+                    edited = False
+            if not edited:
+                try:
+                    if not self._alive or (seq and seq != self._seq):
+                        return
+                    await self.status_msg.edit_text(text, parse_mode="markdown")
+                    edited = True
+                except Exception:
+                    edited = False
+            # If the edit failed, don't sit on the throttle — retry on the
+            # next updateFile / poll instead of looking frozen for 8-16s.
+            if not edited:
+                if self._phase == "download":
+                    self._last_dl = 0.0
+                else:
+                    self._last_ul = 0.0
 
 
 # ── TDLIB updateFile → TransferProgress BRIDGE ────────────────────────────────
@@ -188,6 +249,8 @@ async def dispatch_update_file(file_obj) -> None:
     total  = getattr(file_obj, 'size', 0) or getattr(file_obj, 'expected_size', 0) or 0
     for tracker, phase in list(watchers):
         try:
+            if not getattr(tracker, '_alive', True):
+                continue
             if phase == 'download':
                 current = getattr(local, 'downloaded_size', 0) or 0
                 await tracker.download_cb(current, total)

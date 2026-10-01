@@ -777,10 +777,38 @@ def register_handlers(bot_client):
             return
         parts = message_plain_text(message).split()
         if len(parts) < 2:
-            await _reply(message, "Usage: `/set_log CHANNEL_ID`")
+            await _reply(message, "Usage: `/set_log CHANNEL_ID`\nExample: `/set_log -1001234567890`")
             return
-        await db.set_config("log_channel", parts[1])
-        await _reply(message, f"✅ Log channel set to `{parts[1]}`")
+        raw = parts[1].strip().replace("https://t.me/c/", "").split("/")[0]
+        try:
+            cid = int(raw) if raw.lstrip('-').isdigit() else None
+        except Exception:
+            cid = None
+        if cid is None:
+            await _reply(
+                message,
+                "❌ Numeric channel id do, jaise `-1001234567890`.\n"
+                "Channel ke kisi post ka share link se bhi nikal sakte ho."
+            )
+            return
+        # Private t.me/c/CHATID links omit the -100 prefix.
+        if cid > 0 and len(str(cid)) >= 9:
+            cid = int(f"-100{cid}")
+        await db.set_config("log_channel", str(cid))
+        note = ""
+        try:
+            chat = await bot_client.getChat(chat_id=cid)
+            if config.is_error(chat):
+                note = (
+                    f"\n⚠️ Bot is channel ko abhi load nahi kar paya: `{config.err_text(chat)}`\n"
+                    "Bot ko log channel me **admin** banao, phir ek test clone chalao."
+                )
+            else:
+                title = getattr(chat, 'title', cid)
+                note = f"\n📌 Chat: **{title}**"
+        except Exception as e:
+            note = f"\n⚠️ getChat failed: `{e}` — bot ko log channel me admin banao."
+        await _reply(message, f"✅ Log channel set to `{cid}`{note}")
 
     @bot_client.on_message(filters=f_and(f_command("extract_string"), f_private()))
     async def extract_string_handler(client, message):

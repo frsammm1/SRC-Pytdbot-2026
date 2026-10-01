@@ -130,6 +130,95 @@ def _topic_kw(dest_topic_id):
     return {'topic_id': types.MessageTopicForum(forum_topic_id=int(dest_topic_id))}
 
 
+def _named_temp_path(user_id, msg_id, filename: str) -> str:
+    """
+    TDLib InputFileLocal has NO filename field — Telegram names the uploaded
+    document after the local basename. So the original (manipulated) name
+    MUST be the last path component, otherwise dest/logs show `tf_123_456_…`.
+    """
+    safe = sanitize_filename(filename or "file")
+    safe = os.path.basename(safe).strip() or "file"
+    if safe in ('.', '..'):
+        safe = "file"
+    root, ext = os.path.splitext(safe)
+    if len(safe) > 180:
+        safe = (root[: max(1, 180 - len(ext))] + ext) or "file"
+    workdir = f"/tmp/tf_{user_id}_{msg_id}_{int(time.time())}"
+    os.makedirs(workdir, exist_ok=True)
+    return os.path.join(workdir, safe)
+
+
+def _cleanup_temp(path):
+    """Remove a temp file and its unique workdir if we created one."""
+    if not path:
+        return
+    try:
+        path = str(path)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            return
+        if os.path.exists(path):
+            os.remove(path)
+        parent = os.path.dirname(path)
+        if (
+            parent.startswith('/tmp/tf_')
+            and os.path.isdir(parent)
+            and not os.listdir(parent)
+        ):
+            try:
+                os.rmdir(parent)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _as_sent_message(sent):
+    if not sent or isinstance(sent, bool):
+        return None
+    if getattr(sent, 'id', None) is not None:
+        return sent
+    for m in (getattr(sent, 'messages', None) or []):
+        if m is not None:
+            return m
+    return None
+
+
+def _ptb_message_id(msg) -> int | None:
+    raw = getattr(msg, 'id', None) if not isinstance(msg, int) else msg
+    if not raw:
+        return None
+    raw = int(raw)
+    if raw > 0 and (raw & ((1 << 20) - 1)) == 0:
+        return raw >> 20
+    return raw
+
+
+def _remote_id_from_sent(sent_msg):
+    c = getattr(sent_msg, 'content', None)
+    name = _cname(c)
+    try:
+        f = None
+        if name == 'MessageVideo':
+            f = c.video.video
+        elif name == 'MessageAudio':
+            f = c.audio.audio
+        elif name == 'MessageDocument':
+            f = c.document.document
+        elif name == 'MessageAnimation':
+            f = c.animation.animation
+        elif name == 'MessagePhoto':
+            sizes = c.photo.sizes or []
+            f = sizes[-1].photo if sizes else None
+        elif name == 'MessageSticker':
+            f = c.sticker.sticker
+        if f is not None:
+            return getattr(getattr(f, 'remote', None), 'id', None)
+    except Exception:
+        return None
+    return None
+
+
 def _raise_if_error(res, context: str = ""):
     """Convert a TDLib Error into the legacy exception vocabulary."""
     if not config.is_error(res):
@@ -559,6 +648,16 @@ async def td_download(client, message, dest_path: str, tracker=None) -> str:
                     if getattr(local, 'is_downloading_completed', False):
                         break
                     cur = getattr(local, 'downloaded_size', 0) or 0
+                    if tracker:
+                        total = (
+                            getattr(f, 'size', 0)
+                            or getattr(f, 'expected_size', 0)
+                            or 0
+                        )
+                        try:
+                            await tracker.download_cb(cur, total)
+                        except Exception:
+                            pass
                     if cur != last_bytes:
                         last_bytes    = cur
                         last_progress = time.time()
@@ -625,21 +724,175 @@ async def td_download_remote_id(client, remote_file_id: str, dest_path: str) -> 
 
 # ── LOG TRANSFER ──────────────────────────────────────────────────────────────
 
+async def _warmup_log_channel(bot_client, log_channel):
+    """
+    Resolve / load the log channel on this TDLib instance.
+
+    Worker dynos start with an empty TDLib chat cache, so forward/copy to a
+    never-seen chat_id silently fails. We also re-read Mongo if the task
+    payload didn't carry a log_channel (resume / old checkpoints).
+    """
+    if not log_channel:
+        try:
+            raw = await db.get_config("log_channel")
+        except Exception:
+            raw = None
+        if not raw:
+            config.logger.warning("📭 log_channel not set — use /set_log CHANNEL_ID")
+            return None
+        log_channel = raw
+    try:
+        log_id = int(str(log_channel).strip())
+    except Exception:
+        config.logger.error(f"📭 Invalid log_channel value: {log_channel!r}")
+        return None
+    try:
+        chat = await bot_client.getChat(chat_id=log_id)
+        if config.is_error(chat):
+            config.logger.warning(
+                f"📭 getChat(log {log_id}) failed: {config.err_text(chat)} "
+                f"— will still try PTB copy"
+            )
+        else:
+            config.logger.info(
+                f"📭 Log channel ready: {getattr(chat, 'title', log_id)!r} ({log_id})"
+            )
+    except Exception as e:
+        config.logger.warning(f"📭 Log channel warmup: {e}")
+    return log_id
+
+
 async def log_transfer(bot_client, log_channel, sent_message,
-                        session_id, dest_id, file_name, part_num=None):
-    if not log_channel or not sent_message or isinstance(sent_message, bool):
+                        session_id, dest_id, file_name, part_num=None,
+                        file_path=None, is_video=False, is_audio=False,
+                        caption=None):
+    """
+    Copy the just-sent dest message into the admin log channel.
+
+    Strategy (first success wins, never raises):
+      1. PTB copyMessage / forwardMessage — HTTP Bot API does not depend on
+         this dyno's TDLib chat cache, so it works on fresh worker dynos.
+      2. TDLib sendCopy (and forwardMessages if the client exposes it).
+      3. Reuse the already-uploaded file (InputFileId / InputFileRemote) or
+         re-send from disk. Used when dest has restricted forwarding.
+    """
+    if not log_channel:
         return
     try:
-        res = await bot_client.forwardMessages(
-            chat_id=int(log_channel),
-            from_chat_id=dest_id,
-            message_ids=[sent_message.id],
-        )
-        if config.is_error(res):
-            raise Exception(config.err_text(res))
-    except Exception as e:
-        config.logger.error(f"Log error: {e}")
+        log_id = int(log_channel)
+    except Exception:
+        config.logger.error(f"📭 Invalid log_channel: {log_channel!r}")
+        return
 
+    sent = _as_sent_message(sent_message)
+    tag  = str(file_name or "file")
+    if part_num:
+        tag = f"{tag} (part {part_num})"
+
+    # ── 1) PTB copy/forward ───────────────────────────────────────────────
+    ptb_mid = _ptb_message_id(sent) if sent else None
+    if ptb_mid and dest_id:
+        try:
+            ptb = await config.get_ptb_bot()
+            try:
+                await ptb.copy_message(
+                    chat_id=log_id,
+                    from_chat_id=int(dest_id),
+                    message_id=ptb_mid,
+                )
+                config.logger.info(f"📭 Logged (PTB copy): {tag}")
+                return
+            except Exception as e1:
+                config.logger.warning(f"📭 PTB copy failed ({tag}): {e1}")
+                try:
+                    await ptb.forward_message(
+                        chat_id=log_id,
+                        from_chat_id=int(dest_id),
+                        message_id=ptb_mid,
+                    )
+                    config.logger.info(f"📭 Logged (PTB forward): {tag}")
+                    return
+                except Exception as e2:
+                    config.logger.warning(f"📭 PTB forward failed ({tag}): {e2}")
+        except Exception as e:
+            config.logger.warning(f"📭 PTB log path failed ({tag}): {e}")
+
+    # ── 2) TDLib copy ─────────────────────────────────────────────────────
+    if sent and getattr(sent, 'id', None) and dest_id:
+        try:
+            res = await bot_client.sendCopy(
+                chat_id=int(log_id),
+                from_chat_id=int(dest_id),
+                message_id=int(sent.id),
+            )
+            if not config.is_error(res):
+                config.logger.info(f"📭 Logged (TDLib copy): {tag}")
+                return
+            config.logger.warning(
+                f"📭 TDLib sendCopy failed ({tag}): {config.err_text(res)}"
+            )
+        except Exception as e:
+            config.logger.warning(f"📭 TDLib sendCopy error ({tag}): {e}")
+
+        fwd = getattr(bot_client, 'forwardMessages', None)
+        if callable(fwd):
+            try:
+                res = await fwd(
+                    chat_id=int(log_id),
+                    from_chat_id=int(dest_id),
+                    message_ids=[int(sent.id)],
+                    send_copy=True,
+                )
+                if not config.is_error(res):
+                    config.logger.info(f"📭 Logged (TDLib forward): {tag}")
+                    return
+                config.logger.warning(
+                    f"📭 TDLib forwardMessages failed ({tag}): {config.err_text(res)}"
+                )
+            except Exception as e:
+                config.logger.warning(f"📭 TDLib forwardMessages error ({tag}): {e}")
+
+    # ── 3) Reuse uploaded file / disk resend ──────────────────────────────
+    try:
+        from pytdbot import types
+        infile = None
+        local_fid  = _sent_file_id(sent) if sent else None
+        remote_fid = _remote_id_from_sent(sent) if sent else None
+        InputFileId = getattr(types, 'InputFileId', None)
+        if local_fid is not None and InputFileId is not None:
+            try:
+                infile = InputFileId(id=int(local_fid))
+            except Exception:
+                infile = None
+        if infile is None and remote_fid:
+            infile = types.InputFileRemote(id=str(remote_fid))
+        if infile is None and file_path and os.path.exists(str(file_path)):
+            infile = types.InputFileLocal(path=str(file_path))
+        if infile is None:
+            config.logger.error(f"📭 Log skip — no message/file for {tag}")
+            return
+
+        cap    = caption or f"📦 {tag}"
+        cap_ft = await _parse_caption_html(bot_client, cap)
+        # Log archive is always a document so we never depend on video/audio
+        # constructor defaults — the original filename is already on disk.
+        content = types.InputMessageDocument(
+            document=types.InputDocument(
+                document=infile,
+                disable_content_type_detection=True,
+            ),
+            caption=cap_ft,
+        )
+        res = await bot_client.sendMessage(
+            chat_id=int(log_id),
+            input_message_content=content,
+        )
+        if not config.is_error(res):
+            config.logger.info(f"📭 Logged (file reuse/resend): {tag}")
+            return
+        config.logger.error(f"📭 Log resend failed ({tag}): {config.err_text(res)}")
+    except Exception as e:
+        config.logger.error(f"📭 Log error ({tag}): {e}")
 
 # ── BOT_CLIENT DISK UPLOAD (ALL files, any size) via TDLib ───────────────────
 
@@ -948,6 +1201,8 @@ async def transfer_process(
     except Exception as e:
         config.logger.warning(f"PTB init failed (progress edits fall back to TDLib): {e}")
 
+    log_channel = await _warmup_log_channel(bot_client, log_channel)
+
     # ── STEP 0c: Download custom thumbnail once (if user set one) ─────────────
     custom_thumb_path = None
     thumbnail_file_id = settings.get('thumbnail_file_id')
@@ -1118,6 +1373,10 @@ async def transfer_process(
             success      = False
             temp_path    = None
             thumb_path   = None
+            progress_tracker = None
+            is_video_mode    = False
+            is_audio         = False
+            modified_caption = None
 
             try:
                 content_name = _cname(getattr(message, 'content', None))
@@ -1142,14 +1401,11 @@ async def transfer_process(
                             total_success      += 1
                             consecutive_errors  = 0
                             if log_channel:
-                                try:
-                                    await bot_client.sendTextMessage(
-                                        int(log_channel),
-                                        f"📝 **Log**\n{modified_text[:80]}",
-                                        parse_mode="html",
-                                    )
-                                except Exception:
-                                    pass
+                                await log_transfer(
+                                    bot_client, log_channel, sent_message,
+                                    session_id, dest_id, "text",
+                                    caption=modified_text,
+                                )
                         except FloodWaitError:
                             raise
                         except PermissionError:
@@ -1316,7 +1572,7 @@ async def transfer_process(
                     # between "Scanning…" and the first throttled updateFile.
                     await progress_tracker.download_cb(0, file_size, force=True)
 
-                    temp_path = f"/tmp/tf_{user_id}_{message.id}_{int(time.time())}"
+                    temp_path = _named_temp_path(user_id, message.id, file_name)
 
                     # Video's own thumbnail (custom thumb takes priority)
                     if is_video_mode and auto_thumb_remote and not custom_thumb_path:
@@ -1353,7 +1609,9 @@ async def transfer_process(
                                     f".part{part_num:03d}"
                                     f"{os.path.splitext(file_name)[1]}"
                                 )
-                                part_path = f"/tmp/tf_part_{user_id}_{message.id}_{i}"
+                                part_path = _named_temp_path(
+                                    user_id, f"{message.id}_p{i}", part_name
+                                )
                                 part_data = full_file.read(SPLIT_THRESHOLD)
                                 with open(part_path, 'wb') as pf:
                                     pf.write(part_data)
@@ -1365,7 +1623,7 @@ async def transfer_process(
                                     msg_id=message.id,
                                 )
                                 part_tracker.reset_for_upload()
-                                part_ok, _ = await _bot_disk_upload(
+                                part_ok, part_sent = await _bot_disk_upload(
                                     bot_client, dest_id,
                                     part_path, part_name, len(part_data),
                                     part_cap,
@@ -1374,14 +1632,22 @@ async def transfer_process(
                                     dest_topic_id=dest_topic_id,
                                     progress_tracker=part_tracker,
                                 )
-                                try: os.remove(part_path)
-                                except Exception: pass
+                                if part_ok and log_channel:
+                                    await log_transfer(
+                                        bot_client, log_channel, part_sent,
+                                        session_id, dest_id, part_name,
+                                        part_num=part_num,
+                                        file_path=part_path,
+                                        caption=part_cap,
+                                    )
+                                part_tracker.invalidate()
+                                _cleanup_temp(part_path)
 
                                 if not part_ok:
                                     all_parts_ok = False
                                     break
 
-                        try: os.remove(str(downloaded))
+                        try: _cleanup_temp(str(downloaded))
                         except Exception: pass
                         temp_path = None
 
@@ -1401,7 +1667,6 @@ async def transfer_process(
 
                         # Instantly flip the bar to the upload phase so it
                         # never looks stuck on the last download frame.
-                        await progress_tracker.download_cb(file_size, file_size, force=True)
                         progress_tracker.reset_for_upload()
 
                         ok, sent_message = await _bot_disk_upload(
@@ -1426,10 +1691,14 @@ async def transfer_process(
                     elapsed             = time.time() - start_time
                     total_size         += file_size
 
-                    if log_channel and sent_message:
+                    if log_channel and sent_message and not isinstance(sent_message, bool):
                         await log_transfer(
                             bot_client, log_channel, sent_message,
-                            session_id, dest_id, file_name
+                            session_id, dest_id, file_name,
+                            file_path=temp_path,
+                            is_video=is_video_mode,
+                            is_audio=is_audio,
+                            caption=modified_caption,
                         )
 
                 else:
@@ -1501,10 +1770,13 @@ async def transfer_process(
                     break
 
             finally:
+                if progress_tracker is not None:
+                    try:
+                        progress_tracker.invalidate()
+                    except Exception:
+                        pass
                 for p in [temp_path, thumb_path]:
-                    if p and os.path.exists(str(p)):
-                        try: os.remove(str(p))
-                        except Exception: pass
+                    _cleanup_temp(p)
 
         # ── POST-LOOP ─────────────────────────────────────────────────────────
         if last_seen_id < end_msg and last_seen_id >= start_msg:

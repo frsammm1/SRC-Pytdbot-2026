@@ -449,7 +449,14 @@ def get_target_info(message):
 
     media_obj = c.video if name == 'MessageVideo' else (c.audio if name == 'MessageAudio' else c.document)
     mime          = getattr(media_obj, 'mime_type', '') or ''
-    original_name = getattr(media_obj, 'file_name', '') or f"File_{mid}"
+    original_name = ''
+    for attr in ('file_name', 'fileName'):
+        val = getattr(media_obj, attr, None)
+        if isinstance(val, str) and val.strip():
+            original_name = val.strip()
+            break
+    if not original_name:
+        original_name = f"File_{mid}"
     base_name     = os.path.splitext(original_name)[0]
 
     # ── Video ─────────────────────────────────────────────────────────────
