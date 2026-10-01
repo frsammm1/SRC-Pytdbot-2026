@@ -1,5 +1,4 @@
 pytdbot[tdjson]==0.10.1
-tdjson==1.8.65
 aiohttp
 python-dotenv
 uvloop
