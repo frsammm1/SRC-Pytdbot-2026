@@ -7,9 +7,9 @@ WHY THROTTLING IS CRITICAL:
   With 8-second throttle → ~6 edits in 50 seconds → safe for 30+ concurrent users.
 
 WHY EDITS GO THROUGH PTB (HTTP Bot API) INSTEAD OF TDLIB (MTProto):
-  Same reasoning as the Pyrofork version: PTB's HTTPS path has its own
-  rate-limit bucket, completely separate from the TDLib connections doing
-  the actual download/upload work.
+  PTB's HTTPS path has its own rate-limit bucket, completely separate from
+  the TDLib connections doing the actual download/upload work. PTB is used
+  ONLY for these status edits — every file itself travels via TDLib.
 
 TDLIB WIRING:
   Pyrogram passed (current, total) into a progress callback. TDLib instead
@@ -66,18 +66,18 @@ class TransferProgress:
 
     # ── PUBLIC API ────────────────────────────────────────────────────────────
 
-    async def download_cb(self, current: int, total: int):
+    async def download_cb(self, current: int, total: int, force: bool = False):
         now = time.time()
-        if now - self._last_dl < config.DOWNLOAD_PROGRESS_INTERVAL:
+        if not force and now - self._last_dl < config.DOWNLOAD_PROGRESS_INTERVAL:
             return
         self._last_dl = now
         self._phase   = "download"
         text = self._build_text(current, total)
         asyncio.create_task(self._safe_edit(text))
 
-    async def upload_cb(self, current: int, total: int):
+    async def upload_cb(self, current: int, total: int, force: bool = False):
         now = time.time()
-        if now - self._last_ul < config.UPLOAD_PROGRESS_INTERVAL:
+        if not force and now - self._last_ul < config.UPLOAD_PROGRESS_INTERVAL:
             return
         self._last_ul = now
         self._phase   = "upload"
@@ -85,9 +85,13 @@ class TransferProgress:
         asyncio.create_task(self._safe_edit(text))
 
     def reset_for_upload(self):
+        """Switch to the upload phase and IMMEDIATELY show an upload bar so
+        the status never looks stuck on the last download frame."""
         self._start_time = time.time()
         self._last_ul    = 0.0
         self._phase      = "upload"
+        text = self._build_text(0, self.file_size)
+        asyncio.create_task(self._safe_edit(text))
 
     # ── INTERNAL ──────────────────────────────────────────────────────────────
 
@@ -96,9 +100,9 @@ class TransferProgress:
         elapsed = time.time() - self._start_time
         speed   = current / elapsed if elapsed > 0 else 0
         eta     = (total - current) / speed if speed > 0 else 0
-        pct     = current * 100 / total
-        filled  = math.floor(pct / 100 * 20)
-        bar     = "▰" * filled + "▱" * (20 - filled)
+        pct     = min(100.0, current * 100 / total)
+        filled  = math.floor(pct / 100 * 12)
+        bar     = "▓" * filled + "░" * (12 - filled)
 
         if self._phase == "download":
             icon  = "📥"
@@ -108,16 +112,16 @@ class TransferProgress:
             label = "Uploading"
 
         name = self.file_name or "file"
-        name_display = (name[:40] + "…") if len(name) > 40 else name
+        name_display = (name[:38] + "…") if len(name) > 38 else name
 
-        msg_line = f" — Msg #{self.msg_id}" if self.msg_id else ""
+        msg_line = f" • #{self.msg_id}" if self.msg_id else ""
 
         return (
-            f"{icon} {label}{msg_line}\n"
-            f"{bar} {pct:.1f}%\n\n"
-            f"{name_display}\n\n"
-            f"⚡ {human_readable_size(speed)}/s   ⏱ ETA {time_formatter(eta)}\n"
-            f"💾 {human_readable_size(current)} / {human_readable_size(total)}"
+            f"{icon} **{label}**{msg_line}\n"
+            f"`{bar}` **{pct:.0f}%**\n"
+            f"`{name_display}`\n"
+            f"💾 `{human_readable_size(current)}/{human_readable_size(total)}`  "
+            f"⚡`{human_readable_size(speed)}/s`  ⏱`{time_formatter(eta)}`"
         )
 
     async def _safe_edit(self, text: str):
@@ -129,12 +133,13 @@ class TransferProgress:
                     chat_id=self._chat_id,
                     message_id=self._message_id,
                     text=text,
+                    parse_mode="markdown",
                 )
                 return
             except Exception:
                 pass
         try:
-            await self.status_msg.edit_text(text)
+            await self.status_msg.edit_text(text, parse_mode="markdown")
         except Exception:
             pass
 
@@ -195,12 +200,18 @@ async def dispatch_update_file(file_obj) -> None:
 
 # ── TDLIB MESSAGE-SEND TRACKING ───────────────────────────────────────────────
 #
-# TDLib's sendMessage returns IMMEDIATELY with a temporary message whose
-# sending_state is MessageSendingStatePending — the upload continues in the
-# background. The final message arrives later via updateMessageSendSucceeded
-# (or updateMessageSendFailed). transfer.py awaits these futures so an
-# "uploaded" file is only counted once Telegram has REALLY accepted it —
-# same guarantee Pyrogram's blocking send_*() calls gave us.
+# transfer.py sends big files via the RAW TDLib sendMessage() call, which
+# returns a PENDING message instantly (upload continues in the background).
+# We register a future keyed by that pending (temporary) message id BEFORE the
+# upload can finish, then await updateMessageSendSucceeded /
+# updateMessageSendFailed — the same completion guarantee Pyrogram's blocking
+# send_*() calls gave us, plus live upload progress via updateFile.
+#
+# ⚠️ Do NOT use pytdbot's sendVideo/sendDocument helpers for big files:
+# they internally await updateMessageSendSucceeded themselves
+# (sendMessageWithContent → _create_request_future), so by the time they
+# return, the completion update has ALREADY fired and consumed — any future
+# registered afterwards waits forever (the v7.4 "upload stalled" bug).
 
 _pending_sends: dict[int, asyncio.Future] = {}   # temp message_id → Future
 

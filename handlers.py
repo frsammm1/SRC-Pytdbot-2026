@@ -1365,9 +1365,13 @@ def register_handlers(bot_client):
         # so users could paste pre-formatted HTML text from another message).
         _content_type = _cname(getattr(message, 'content', None))
         if _content_type != 'MessageText' and step != 'wait_thumbnail':
-            if step in ('wait_start_link', 'wait_end_link', 'wait_dest_input',
-                        'fname_find', 'fname_replace', 'cap_find',
-                        'cap_remove', 'wait_dest_topic'):
+            # A FORWARDED media message is valid input at wait_dest_input —
+            # its forward_info carries the destination chat id.
+            if step == 'wait_dest_input' and getattr(message, 'forward_info', None) is not None:
+                pass
+            elif step in ('wait_start_link', 'wait_end_link', 'wait_dest_input',
+                          'fname_find', 'fname_replace', 'cap_find',
+                          'cap_remove', 'wait_dest_topic'):
                 return
 
         def _cancel_kb():

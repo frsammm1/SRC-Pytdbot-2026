@@ -437,7 +437,9 @@ def get_target_info(message):
         return f"VideoNote_{mid}.mp4", "video/mp4", True
 
     if name == 'MessageAnimation':
-        return f"Animation_{mid}.mp4", "video/mp4", False
+        # GIFs/animations are mp4 — send as streamable video so they play
+        # inline at the destination instead of arriving as bare documents.
+        return f"Animation_{mid}.mp4", "video/mp4", True
 
     if name == 'MessageVoiceNote':
         return f"Voice_{mid}.ogg", "audio/ogg", False

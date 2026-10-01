@@ -6,9 +6,13 @@ Behaviour is 1:1 with the Pyrofork v6.2 engine:
     thumbnails, caption/filename manipulations and logging behave the same
     everywhere.
   • Videos re-upload as STREAMABLE videos (supports_streaming=True), audio as
-    playable audio (duration preserved), images as viewable photos.
-  • Files < 45 MB go out via PTB (HTTP Bot API); bigger ones via the TDLib
-    bot client. > 2 GiB files are split into 2 GiB parts.
+    playable audio (duration preserved), images as viewable photos,
+    animations/GIFs as streamable videos, stickers as real stickers.
+  • EVERY file — small or big — goes via the TDLib bot client:
+    download to disk (user client) → upload from disk (bot client).
+    PTB is used ONLY for progress-bar message edits (separate HTTP
+    rate-limit bucket), never for file payloads. > 2 GiB files are split
+    into 2 GiB parts.
   • Real-time checkpointing + commit-pointer semantics unchanged — a failed
     message is NEVER skipped; the run stops and auto-resume retries it.
 
@@ -52,7 +56,7 @@ import database as db
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 
 SPLIT_THRESHOLD     = config.SPLIT_FILE_THRESHOLD   # exactly 2 GiB
-GET_MESSAGES_BATCH  = 200    # same batch size as the Pyrogram version
+GET_MESSAGES_BATCH  = 100    # TDLib getMessages() practical ceiling per call
 
 
 # ── SMALL HELPERS ─────────────────────────────────────────────────────────────
@@ -637,115 +641,22 @@ async def log_transfer(bot_client, log_channel, sent_message,
         config.logger.error(f"Log error: {e}")
 
 
-# ── PTB SEND (< 45 MB) — reads straight from disk ─────────────────────────────
+# ── BOT_CLIENT DISK UPLOAD (ALL files, any size) via TDLib ───────────────────
 
-async def _ptb_send_media(
-    ptb_bot, dest_id: int,
-    file_path: str, file_name: str, mime_type: str, caption: str,
-    dest_topic_id, is_photo: bool, is_video: bool, is_audio: bool,
-    thumb_path: str = None,
-    duration: int = 0,
-    width: int = 0,
-    height: int = 0,
-) -> bool:
-    """
-    Upload a file living on disk to dest_id via PTB Bot API.
-    Unchanged from the Pyrofork version — PTB is plain HTTP Bot API.
-    """
-    from telegram import InputFile
-    from telegram.error import RetryAfter, Forbidden, TelegramError
-    from telegram.constants import ParseMode as PTBParseMode
+async def _parse_caption_html(client, caption: str):
+    """HTML caption string → TDLib FormattedText (plain-text fallback)."""
+    from pytdbot import types
+    caption = caption or ''
+    if not caption:
+        return types.FormattedText(text='', entities=[])
+    try:
+        ft = await client.parseText(caption, parse_mode='html')
+        if ft is not None and not config.is_error(ft):
+            return ft
+    except Exception:
+        pass
+    return types.FormattedText(text=caption, entities=[])
 
-    common = {
-        'chat_id':    dest_id,
-        'caption':    caption or '',
-        'parse_mode': PTBParseMode.HTML,
-    }
-    if dest_topic_id:
-        common['message_thread_id'] = dest_topic_id
-
-    for attempt in range(config.MAX_RETRIES):
-        file_handle  = None
-        thumb_handle = None
-        try:
-            file_handle = open(file_path, 'rb')
-            inp = InputFile(file_handle, filename=file_name)
-
-            thumb_inp = None
-            if thumb_path and os.path.exists(thumb_path):
-                thumb_handle = open(thumb_path, 'rb')
-                thumb_inp = InputFile(thumb_handle, filename="thumb.jpg")
-
-            if is_photo:
-                await ptb_bot.send_photo(**common, photo=inp)
-
-            elif is_video:
-                await ptb_bot.send_video(
-                    **common,
-                    video=inp,
-                    supports_streaming=True,
-                    thumbnail=thumb_inp,
-                    duration=duration or None,
-                    width=width   or None,
-                    height=height or None,
-                )
-
-            elif is_audio:
-                await ptb_bot.send_audio(
-                    **common,
-                    audio=inp,
-                    duration=duration or None,
-                )
-
-            else:
-                await ptb_bot.send_document(
-                    **common,
-                    document=inp,
-                    filename=file_name,
-                    disable_content_type_detection=True,
-                )
-
-            return True
-
-        except RetryAfter as e:
-            wait = e.retry_after + 2
-            config.logger.warning(f"⏳ PTB RetryAfter {e.retry_after}s — waiting {wait}s")
-            await asyncio.sleep(wait)
-
-        except Forbidden as e:
-            raise PermissionError(
-                f"❌ **Bot cannot post in destination channel.**\n"
-                f"Make sure the bot is **Full Admin** there.\n`{e}`"
-            )
-
-        except TelegramError as e:
-            backoff = min(10 * (2 ** attempt), 120)
-            config.logger.error(
-                f"PTB send attempt {attempt+1}/{config.MAX_RETRIES} failed "
-                f"for {file_name}: {e} — retrying in {backoff}s"
-            )
-            await asyncio.sleep(backoff)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as e:
-            backoff = min(10 * (2 ** attempt), 120)
-            config.logger.error(f"PTB unknown error (attempt {attempt+1}): {e} — retrying in {backoff}s")
-            await asyncio.sleep(backoff)
-
-        finally:
-            if file_handle:
-                try: file_handle.close()
-                except Exception: pass
-            if thumb_handle:
-                try: thumb_handle.close()
-                except Exception: pass
-
-    return False
-
-
-# ── BOT_CLIENT DISK UPLOAD (≥ 45 MB) via TDLib ───────────────────────────────
 
 def _sent_file_id(sent_msg):
     """Extract the TDLib file id from a pending sent message (for upload progress)."""
@@ -779,9 +690,17 @@ async def _bot_disk_upload(
     Supports files up to ~2 GiB per call.
     Returns (success: bool, sent_message).
 
-    TDLib semantics: sendX() returns a PENDING message instantly; we register
-    a future for its temp id and await updateMessageSendSucceeded — the same
-    point in time Pyrogram's blocking call would have returned.
+    ⚠️ CRITICAL pytdbot SEMANTICS (the v7.4 "upload stalled" bug):
+    pytdbot's sendVideo/sendDocument HELPERS do not return the pending
+    message — they internally await updateMessageSendSucceeded
+    (sendMessageWithContent → _create_request_future) and only return the
+    FINAL message. Registering our bridge future after such a call means
+    the completion update has ALREADY fired and been consumed → the future
+    never resolves → every upload "stalled" past its timeout, got deleted
+    and retried forever. So we call RAW sendMessage() instead: it returns
+    the PENDING message instantly, letting us (1) register the completion
+    future BEFORE the upload can finish and (2) watch the file's
+    remote.uploaded_size for a live upload progress bar.
     """
     from pytdbot import types
 
@@ -793,43 +712,52 @@ async def _bot_disk_upload(
             height=height or 0,
         )
 
-    topic = _topic_kw(dest_topic_id)
+    topic          = _topic_kw(dest_topic_id)
     upload_timeout = config.get_upload_timeout(file_size)
+    caption_ft     = await _parse_caption_html(bot_client, caption)
 
-    for attempt in range(config.MAX_RETRIES):
-        fut = None
-        try:
-            if is_video:
-                res = await bot_client.sendVideo(
-                    chat_id=dest_id,
+    def _build_content():
+        if is_video:
+            return types.InputMessageVideo(
+                video=types.InputVideo(
                     video=types.InputFileLocal(path=file_path),
                     thumbnail=thumb,
-                    caption=caption or '',
-                    parse_mode="html",
-                    supports_streaming=True,
                     duration=duration or 0,
                     width=width or 0,
                     height=height or 0,
-                    **topic,
-                )
-            elif is_audio:
-                res = await bot_client.sendAudio(
-                    chat_id=dest_id,
+                    supports_streaming=True,
+                ),
+                caption=caption_ft,
+            )
+        if is_audio:
+            return types.InputMessageAudio(
+                audio=types.InputAudio(
                     audio=types.InputFileLocal(path=file_path),
-                    caption=caption or '',
-                    parse_mode="html",
+                    album_cover_thumbnail=thumb,
                     duration=duration or 0,
-                    **topic,
-                )
-            else:
-                res = await bot_client.sendDocument(
-                    chat_id=dest_id,
-                    document=types.InputFileLocal(path=file_path),
-                    caption=caption or '',
-                    parse_mode="html",
-                    disable_content_type_detection=True,
-                    **topic,
-                )
+                ),
+                caption=caption_ft,
+            )
+        return types.InputMessageDocument(
+            document=types.InputDocument(
+                document=types.InputFileLocal(path=file_path),
+                thumbnail=thumb,
+                disable_content_type_detection=True,
+            ),
+            caption=caption_ft,
+        )
+
+    for attempt in range(config.MAX_RETRIES):
+        res  = None
+        fut  = None
+        fid  = None
+        try:
+            # RAW sendMessage → returns the PENDING message instantly.
+            res = await bot_client.sendMessage(
+                chat_id=dest_id,
+                input_message_content=_build_content(),
+                **topic,
+            )
 
             if config.is_error(res):
                 retry = config.get_retry_after(res)
@@ -837,7 +765,8 @@ async def _bot_disk_upload(
                     raise FloodWaitError(retry)
                 _raise_if_error(res, "(send)")
 
-            # Message accepted by TDLib, upload running in background.
+            # Register the completion future BEFORE the upload can finish,
+            # then start watching the file's upload progress.
             temp_id = getattr(res, 'id', None)
             fut = register_pending_send(temp_id)
 
@@ -853,6 +782,8 @@ async def _bot_disk_upload(
 
             if final_msg is None:
                 raise RuntimeError("send succeeded but final message missing")
+            if progress_tracker:
+                await progress_tracker.upload_cb(file_size, file_size, force=True)
             return True, final_msg
 
         except asyncio.TimeoutError:
@@ -881,17 +812,17 @@ async def _bot_disk_upload(
                 f"⏳ FloodWait {e.x}s on upload attempt {attempt+1} — "
                 f"waiting {wait}s (not counted as failure)"
             )
-            if fut is not None:
-                cancel_pending_send(getattr(res, 'id', 0) if 'res' in dir() else 0)
+            if fut is not None and res is not None:
+                cancel_pending_send(getattr(res, 'id', 0))
             await asyncio.sleep(wait)
 
         except PermissionError:
-            if fut is not None and 'res' in dir():
+            if fut is not None and res is not None:
                 cancel_pending_send(getattr(res, 'id', 0))
             raise
 
         except asyncio.CancelledError:
-            if fut is not None and 'res' in dir():
+            if fut is not None and res is not None:
                 cancel_pending_send(getattr(res, 'id', 0))
             raise
 
@@ -904,6 +835,40 @@ async def _bot_disk_upload(
             await asyncio.sleep(backoff)
 
     return False, None
+
+
+async def _send_sticker(
+    bot_client, dest_id: int, file_path: str,
+    emoji: str, width: int, height: int, dest_topic_id,
+) -> tuple:
+    """
+    Send a downloaded sticker file as a REAL sticker (webp/tgs/webm).
+    Stickers are tiny, so the blocking pytdbot helper is fine here —
+    no progress bar needed. Falls back to (False, None) on failure so the
+    caller can retry as a plain document.
+    """
+    from pytdbot import types
+    try:
+        res = await bot_client.sendSticker(
+            chat_id=dest_id,
+            sticker=types.InputFileLocal(path=file_path),
+            emoji=emoji or "👍",
+            width=width or 512,
+            height=height or 512,
+            **_topic_kw(dest_topic_id),
+        )
+        if config.is_error(res):
+            retry = config.get_retry_after(res)
+            if retry:
+                raise FloodWaitError(retry)
+            config.logger.warning(f"sendSticker error: {config.err_text(res)}")
+            return False, None
+        return True, res
+    except FloodWaitError:
+        raise
+    except Exception as e:
+        config.logger.warning(f"sendSticker failed: {e} — will try as document")
+        return False, None
 
 
 # ── MAIN TRANSFER FUNCTION ────────────────────────────────────────────────────
@@ -976,12 +941,12 @@ async def transfer_process(
         config.active_sessions.pop(session_id, None)
         return 'stopped_source', None
 
-    # ── STEP 0b: PTB Bot singleton ────────────────────────────────────────────
+    # ── STEP 0b: Warm the PTB singleton (used ONLY for progress-bar edits;
+    # every file payload travels via TDLib) ───────────────────────────────────
     try:
-        ptb_bot = await config.get_ptb_bot()
+        await config.get_ptb_bot()
     except Exception as e:
-        config.logger.warning(f"PTB init failed (will use bot_client only): {e}")
-        ptb_bot = None
+        config.logger.warning(f"PTB init failed (progress edits fall back to TDLib): {e}")
 
     # ── STEP 0c: Download custom thumbnail once (if user set one) ─────────────
     custom_thumb_path = None
@@ -1270,8 +1235,9 @@ async def transfer_process(
 
                 start_time = time.time()
 
-                # ══ PATH A: Photo / Image ═════════════════════════════════
-                if (is_photo or is_image):
+                # ══ PATH A: Photo / Image (TDLib only) ════════════════════
+                # (stickers are 'image/webp' — intercepted by PATH S below)
+                if (is_photo or is_image) and content_name != 'MessageSticker':
                     try:
                         temp_path  = f"/tmp/tf_img_{user_id}_{message.id}_{int(time.time())}.jpg"
                         downloaded = await td_download(user_client, message, temp_path)
@@ -1279,28 +1245,17 @@ async def transfer_process(
                             raise RuntimeError("download returned empty path")
                         temp_path = str(downloaded)
 
-                        if ptb_bot:
-                            ok = await _ptb_send_media(
-                                ptb_bot, dest_id, temp_path, file_name,
-                                'image/jpeg', modified_caption, dest_topic_id,
-                                is_photo=True, is_video=False, is_audio=False,
-                            )
-                            if ok:
-                                success      = True
-                                sent_message = True
-
-                        if not success:
-                            from pytdbot import types as _t
-                            res = await bot_client.sendPhoto(
-                                chat_id=dest_id,
-                                photo=_t.InputFileLocal(path=temp_path),
-                                caption=modified_caption,
-                                parse_mode="html",
-                                **_topic_kw(dest_topic_id),
-                            )
-                            _raise_if_error(res, "(photo)")
-                            sent_message = res
-                            success      = True
+                        from pytdbot import types as _t
+                        res = await bot_client.sendPhoto(
+                            chat_id=dest_id,
+                            photo=_t.InputFileLocal(path=temp_path),
+                            caption=modified_caption,
+                            parse_mode="html",
+                            **_topic_kw(dest_topic_id),
+                        )
+                        _raise_if_error(res, "(photo)")
+                        sent_message = res
+                        success      = True
 
                     except FloodWaitError:
                         raise
@@ -1309,170 +1264,160 @@ async def transfer_process(
                     except Exception as img_e:
                         config.logger.error(f"Image send failed: {img_e}")
 
+                # ══ PATH S: Sticker → real sticker, fallback to document ══
+                elif content_name == 'MessageSticker':
+                    try:
+                        sticker_obj = message.content.sticker
+                        st_emoji    = getattr(sticker_obj, 'emoji', '') or '👍'
+                        st_w        = getattr(sticker_obj, 'width', 0) or 512
+                        st_h        = getattr(sticker_obj, 'height', 0) or 512
+
+                        # Keep the real extension (.webp/.tgs/.webm) so TDLib
+                        # detects the sticker type correctly on re-upload.
+                        st_ext     = os.path.splitext(file_name)[1] or '.webp'
+                        temp_path  = f"/tmp/tf_stk_{user_id}_{message.id}_{int(time.time())}{st_ext}"
+                        downloaded = await td_download(user_client, message, temp_path)
+                        if not downloaded or not os.path.exists(str(downloaded)):
+                            raise RuntimeError("download returned empty path")
+                        temp_path = str(downloaded)
+
+                        success, sent_message = await _send_sticker(
+                            bot_client, dest_id, temp_path,
+                            st_emoji, st_w, st_h, dest_topic_id,
+                        )
+                        if not success:
+                            # Fallback: deliver the raw sticker file as a document
+                            success, sent_message = await _bot_disk_upload(
+                                bot_client, dest_id,
+                                temp_path, file_name, file_size,
+                                modified_caption,
+                                is_video=False, is_audio=False,
+                                thumb_path=None,
+                                dest_topic_id=dest_topic_id,
+                                progress_tracker=None,
+                            )
+
+                    except FloodWaitError:
+                        raise
+                    except PermissionError:
+                        raise
+                    except Exception as stk_e:
+                        config.logger.error(f"Sticker send failed: {stk_e}")
+
                 # ══ PATH B: Non-image files (videos, docs, audio…) ════════
+                # EVERY file, any size: TDLib user-client downloads to disk,
+                # TDLib bot-client uploads from disk. No PTB for payloads.
                 elif not (is_photo or is_image):
                     progress_tracker = TransferProgress(
                         file_name, file_size, status_message, session_data,
                         msg_id=message.id,
                     )
+                    # Show the first download frame immediately — no dead air
+                    # between "Scanning…" and the first throttled updateFile.
+                    await progress_tracker.download_cb(0, file_size, force=True)
 
-                    # ── PTB path: < 45 MB — downloaded to disk, never RAM ────
-                    if ptb_bot and 0 < file_size < config.PTB_SMALL_FILE_LIMIT:
-                        small_thumb_path = None
+                    temp_path = f"/tmp/tf_{user_id}_{message.id}_{int(time.time())}"
+
+                    # Video's own thumbnail (custom thumb takes priority)
+                    if is_video_mode and auto_thumb_remote and not custom_thumb_path:
                         try:
-                            temp_path  = f"/tmp/tf_{user_id}_{message.id}_{int(time.time())}"
-                            downloaded = await td_download(
-                                user_client, message, temp_path,
-                                tracker=progress_tracker,
+                            thumb_path = f"/tmp/thumb_{user_id}_{message.id}.jpg"
+                            await td_download_remote_id(
+                                user_client, auto_thumb_remote, thumb_path,
                             )
-                            if not downloaded or not os.path.exists(str(downloaded)):
-                                raise RuntimeError("download returned empty path")
-                            temp_path = str(downloaded)
+                        except Exception as thumb_e:
+                            config.logger.warning(f"Auto-thumb fetch failed: {thumb_e}")
+                            thumb_path = None
 
-                            # Thumbnail: custom thumb wins, else the video's own.
-                            if is_video_mode:
-                                if custom_thumb_path and os.path.exists(custom_thumb_path):
-                                    small_thumb_path = custom_thumb_path
-                                elif auto_thumb_remote:
-                                    try:
-                                        small_thumb_path = f"/tmp/thumb_{user_id}_{message.id}.jpg"
-                                        await td_download_remote_id(
-                                            user_client, auto_thumb_remote, small_thumb_path,
-                                        )
-                                    except Exception as thumb_e:
-                                        config.logger.warning(f"Auto-thumb fetch failed: {thumb_e}")
-                                        small_thumb_path = None
+                    effective_thumb = custom_thumb_path or thumb_path
 
-                            ok = await _ptb_send_media(
-                                ptb_bot, dest_id, temp_path, file_name, mime_type or '',
-                                modified_caption, dest_topic_id,
-                                is_photo=False,
-                                is_video=is_video_mode,
-                                is_audio=is_audio,
-                                thumb_path=small_thumb_path,
-                                duration=media_duration,
-                                width=media_width,
-                                height=media_height,
-                            )
-                            if ok:
-                                success      = True
-                                sent_message = True
+                    if file_size > SPLIT_THRESHOLD:
+                        # ── Split upload for very large files ─────────
+                        downloaded = await td_download(
+                            user_client, message, temp_path,
+                            tracker=progress_tracker,
+                        )
+                        actual_size = os.path.getsize(str(downloaded))
+                        parts       = math.ceil(actual_size / SPLIT_THRESHOLD)
+                        config.logger.info(f"✂️ Splitting into {parts} parts")
 
-                        except FloodWaitError:
-                            raise
-                        except PermissionError:
-                            raise
-                        except Exception as ptb_e:
-                            config.logger.warning(
-                                f"PTB path failed for {file_name} ({ptb_e}) "
-                                f"— falling back to bot_client disk upload"
-                            )
-                        finally:
-                            if small_thumb_path and small_thumb_path != custom_thumb_path \
-                               and os.path.exists(small_thumb_path):
-                                try: os.remove(small_thumb_path)
+                        all_parts_ok = True
+                        with open(str(downloaded), 'rb') as full_file:
+                            for i in range(parts):
+                                if await _should_stop():
+                                    all_parts_ok = False
+                                    break
+                                part_num  = i + 1
+                                part_name = (
+                                    f"{os.path.splitext(file_name)[0]}"
+                                    f".part{part_num:03d}"
+                                    f"{os.path.splitext(file_name)[1]}"
+                                )
+                                part_path = f"/tmp/tf_part_{user_id}_{message.id}_{i}"
+                                part_data = full_file.read(SPLIT_THRESHOLD)
+                                with open(part_path, 'wb') as pf:
+                                    pf.write(part_data)
+
+                                part_cap = f"{modified_caption}\n\n(Part {part_num}/{parts})"
+                                part_tracker = TransferProgress(
+                                    part_name, len(part_data),
+                                    status_message, session_data,
+                                    msg_id=message.id,
+                                )
+                                part_tracker.reset_for_upload()
+                                part_ok, _ = await _bot_disk_upload(
+                                    bot_client, dest_id,
+                                    part_path, part_name, len(part_data),
+                                    part_cap,
+                                    is_video=False, is_audio=False,
+                                    thumb_path=None,
+                                    dest_topic_id=dest_topic_id,
+                                    progress_tracker=part_tracker,
+                                )
+                                try: os.remove(part_path)
                                 except Exception: pass
 
-                    # ── TDLib bot_client disk path: ≥ 45 MB or PTB failed ─────
-                    if not success:
-                        temp_path = f"/tmp/tf_{user_id}_{message.id}_{int(time.time())}"
+                                if not part_ok:
+                                    all_parts_ok = False
+                                    break
 
-                        # Video's own thumbnail (custom thumb takes priority)
-                        if is_video_mode and auto_thumb_remote and not custom_thumb_path:
-                            try:
-                                thumb_path = f"/tmp/thumb_{user_id}_{message.id}.jpg"
-                                await td_download_remote_id(
-                                    user_client, auto_thumb_remote, thumb_path,
-                                )
-                            except Exception as thumb_e:
-                                config.logger.warning(f"Auto-thumb fetch failed: {thumb_e}")
-                                thumb_path = None
+                        try: os.remove(str(downloaded))
+                        except Exception: pass
+                        temp_path = None
 
-                        effective_thumb = custom_thumb_path or thumb_path
+                        if all_parts_ok:
+                            success      = True
+                            sent_message = True
 
-                        if file_size > SPLIT_THRESHOLD:
-                            # ── Split upload for very large files ─────────
-                            downloaded = await td_download(
-                                user_client, message, temp_path,
-                                tracker=progress_tracker,
-                            )
-                            actual_size = os.path.getsize(str(downloaded))
-                            parts       = math.ceil(actual_size / SPLIT_THRESHOLD)
-                            config.logger.info(f"✂️ Splitting into {parts} parts")
+                    else:
+                        # ── Normal disk download → upload ──────────────
+                        downloaded = await td_download(
+                            user_client, message, temp_path,
+                            tracker=progress_tracker,
+                        )
+                        if not downloaded or not os.path.exists(str(downloaded)):
+                            raise RuntimeError("download returned empty path")
+                        temp_path = str(downloaded)
 
-                            all_parts_ok = True
-                            with open(str(downloaded), 'rb') as full_file:
-                                for i in range(parts):
-                                    if await _should_stop():
-                                        all_parts_ok = False
-                                        break
-                                    part_num  = i + 1
-                                    part_name = (
-                                        f"{os.path.splitext(file_name)[0]}"
-                                        f".part{part_num:03d}"
-                                        f"{os.path.splitext(file_name)[1]}"
-                                    )
-                                    part_path = f"/tmp/tf_part_{user_id}_{message.id}_{i}"
-                                    part_data = full_file.read(SPLIT_THRESHOLD)
-                                    with open(part_path, 'wb') as pf:
-                                        pf.write(part_data)
+                        # Instantly flip the bar to the upload phase so it
+                        # never looks stuck on the last download frame.
+                        await progress_tracker.download_cb(file_size, file_size, force=True)
+                        progress_tracker.reset_for_upload()
 
-                                    part_cap = f"{modified_caption}\n\n(Part {part_num}/{parts})"
-                                    part_tracker = TransferProgress(
-                                        part_name, len(part_data),
-                                        status_message, session_data,
-                                        msg_id=message.id,
-                                    )
-                                    part_ok, _ = await _bot_disk_upload(
-                                        bot_client, dest_id,
-                                        part_path, part_name, len(part_data),
-                                        part_cap,
-                                        is_video=False, is_audio=False,
-                                        thumb_path=None,
-                                        dest_topic_id=dest_topic_id,
-                                        progress_tracker=part_tracker,
-                                    )
-                                    try: os.remove(part_path)
-                                    except Exception: pass
-
-                                    if not part_ok:
-                                        all_parts_ok = False
-                                        break
-
-                            try: os.remove(str(downloaded))
-                            except Exception: pass
-                            temp_path = None
-
-                            if all_parts_ok:
-                                success      = True
-                                sent_message = True
-
-                        else:
-                            # ── Normal disk download → upload ──────────────
-                            downloaded = await td_download(
-                                user_client, message, temp_path,
-                                tracker=progress_tracker,
-                            )
-                            if not downloaded or not os.path.exists(str(downloaded)):
-                                raise RuntimeError("download returned empty path")
-                            temp_path = str(downloaded)
-
-                            progress_tracker.reset_for_upload()
-
-                            ok, sent_message = await _bot_disk_upload(
-                                bot_client, dest_id,
-                                temp_path, file_name, file_size,
-                                modified_caption,
-                                is_video=is_video_mode,
-                                is_audio=is_audio,
-                                thumb_path=effective_thumb,
-                                dest_topic_id=dest_topic_id,
-                                progress_tracker=progress_tracker,
-                                duration=media_duration,
-                                width=media_width,
-                                height=media_height,
-                            )
-                            success = ok
+                        ok, sent_message = await _bot_disk_upload(
+                            bot_client, dest_id,
+                            temp_path, file_name, file_size,
+                            modified_caption,
+                            is_video=is_video_mode,
+                            is_audio=is_audio,
+                            thumb_path=effective_thumb,
+                            dest_topic_id=dest_topic_id,
+                            progress_tracker=progress_tracker,
+                            duration=media_duration,
+                            width=media_width,
+                            height=media_height,
+                        )
+                        success = ok
 
                 # ══ OUTCOME ══════════════════════════════════════════════
                 if success:
