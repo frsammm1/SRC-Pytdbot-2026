@@ -398,13 +398,13 @@ def register_handlers(bot_client):
             )
         else:
             active_subs = await get_active_subscriber_count()
-            dyno_label  = get_dyno_label()
             await _reply(message,
+                f"⚡ **Fastest SRC bot on Telegram**\n"
                 f"👋 **Welcome to Save Restricted Content Bot!**\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Kisi bhi **private ya public** Telegram channel/group se files forward karo —\n"
                 f"chahe **forwarding band** ho tab bhi. **Topics/Threads** bhi supported hain.\n\n"
-                f"✅ Dedicated **{dyno_label}** per user\n"
+                f"✅ Dedicated RAM/Space Per User\n"
                 f"✅ Forward-restricted channel/group supported\n"
                 f"✅ Topics/Threads groups supported\n"
                 f"✅ 2GB+ files · Smart caption & filename editing\n"
@@ -705,7 +705,6 @@ def register_handlers(bot_client):
             await _reply(message, "Usage: `/revoke USER_ID`")
             return
         target_id = int(parts[1])
-        await db.revoke_user(target_id)
         for sid, data in list(config.active_sessions.items()):
             if data.get('user_id') == target_id:
                 config.active_sessions[sid]['stop_flag'] = True
@@ -713,7 +712,7 @@ def register_handlers(bot_client):
                 if task and not task.done():
                     task.cancel()
         dyno_kill_msg = await _kill_user_dyno(target_id)
-        await db.clear_all_task_data(target_id)
+        await db.revoke_user(target_id)
         msg = f"User `{target_id}` revoked."
         if dyno_kill_msg: msg += f"\n{dyno_kill_msg}"
         await _reply(message, msg)
@@ -2221,13 +2220,10 @@ def register_handlers(bot_client):
 
     @bot_client.on_updateNewCallbackQuery(filters=f_cb_regex(r'^bot_stats$'))
     async def stats_cb(client, query):
-        active       = len(config.active_sessions)
-        dynos        = await db.get_all_dynos()
-        active_dynos = sum(1 for d in dynos if d.get('status') == 'running')
-        active_subs  = await get_active_subscriber_count()
+        active_subs = await get_active_subscriber_count()
         try:
             await query.answer(
-                f"v7.0 TDLib | Sessions: {active} | Dynos: {active_dynos} | Subscribers: {active_subs}",
+                f"Subscribers: {active_subs}",
                 show_alert=True
             )
         except Exception:

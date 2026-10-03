@@ -196,11 +196,8 @@ async def get_user_doc(user_id):
 
 
 async def revoke_user(user_id):
-    if db is None: return
-    await db.users.update_one(
-        {'user_id': user_id},
-        {'$set': {'validity_expiry': 0, 'session_string': None}}
-    )
+    """Revoke access and wipe bulky runtime data so Mongo doesn't keep growing."""
+    await purge_user_runtime_data(user_id)
 
 
 async def get_all_users():
@@ -418,38 +415,91 @@ async def get_all_checkpoints() -> list:
         return []
 
 
+async def purge_user_runtime_data(user_id: int) -> None:
+    """
+    Delete a user's bulky/runtime Mongo data (TDLib session archive, phone,
+    password, checkpoints, tasks, dyno record) after expiry or revoke.
+
+    Keeps a thin users stub (user_id / first_name / joined_date /
+    validity_expiry=0) so /start and /buy still work.
+    """
+    if db is None:
+        return
+    try:
+        await db.checkpoints.delete_one({'user_id': user_id})
+        await db.tasks.delete_many({'user_id': user_id})
+        await db.dynos.delete_one({'user_id': user_id})
+        await db.users.update_one(
+            {'user_id': user_id},
+            {
+                '$set': {'validity_expiry': 0},
+                '$unset': {
+                    'session_string': '',
+                    'password': '',
+                    'phone': '',
+                },
+            },
+        )
+        logger.info(f"🧹 Purged runtime DB data for user {user_id}")
+    except Exception as e:
+        logger.error(f"purge_user_runtime_data error ({user_id}): {e}")
+
+
 async def clear_all_task_data(user_id: int) -> None:
-    """Wipe a user's checkpoint + task history. Used on subscription expiry/revoke."""
+    """Wipe a user's checkpoint + task history + dyno record."""
     if db is None: return
     try:
         await db.checkpoints.delete_one({'user_id': user_id})
         await db.tasks.delete_many({'user_id': user_id})
+        await db.dynos.delete_one({'user_id': user_id})
     except Exception as e:
         logger.error(f"clear_all_task_data error: {e}")
 
 
 async def cleanup_expired_subscription_data() -> list:
     """
-    Delete checkpoint/task records for any user whose subscription is no
-    longer active. Users with a valid subscription are never touched — their
-    real-time progress record stays exact so a failure never loses their spot.
+    For every user whose subscription is no longer active: delete checkpoints,
+    tasks, dynos, and bulky session/phone/password fields so Mongo stays small.
+    Active subscribers are never touched.
     Returns the list of affected user_ids.
     """
     if db is None: return []
     affected = []
     try:
-        now = time.time()
-        async for doc in db.checkpoints.find({}):
-            uid = doc.get('user_id')
-            if uid is None:
+        now  = time.time()
+        seen = set()
+
+        async def _maybe_purge(uid, user_doc=None):
+            if uid is None or uid in seen:
+                return
+            if uid == config.ADMIN_ID:
+                return
+            if user_doc is None:
+                try:
+                    user_doc = await db.users.find_one({'user_id': uid})
+                except Exception:
+                    user_doc = None
+            expiry = (user_doc or {}).get('validity_expiry', 0) or 0
+            if expiry > now:
+                return
+            await purge_user_runtime_data(uid)
+            seen.add(uid)
+            affected.append(uid)
+
+        async for user in db.users.find({}):
+            uid    = user.get('user_id')
+            expiry = user.get('validity_expiry', 0) or 0
+            if uid == config.ADMIN_ID or expiry > now:
                 continue
-            user   = await db.users.find_one({'user_id': uid})
-            expiry = user.get('validity_expiry', 0) if user else 0
-            if not expiry or expiry <= now:
-                await clear_all_task_data(uid)
-                affected.append(uid)
+            if user.get('session_string') or user.get('password') or user.get('phone'):
+                await _maybe_purge(uid, user)
+
+        for coll in (db.checkpoints, db.tasks, db.dynos):
+            async for doc in coll.find({}, {'user_id': 1}):
+                await _maybe_purge(doc.get('user_id'))
+
         if affected:
-            logger.info(f"🧹 Cleared checkpoint/task data for expired users: {affected}")
+            logger.info(f"🧹 Purged expired-user DB data: {affected}")
     except Exception as e:
         logger.error(f"cleanup_expired_subscription_data error: {e}")
     return affected

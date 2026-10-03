@@ -11,8 +11,9 @@ Behaviour is 1:1 with the Pyrofork v6.2 engine:
   • EVERY file — small or big — goes via the TDLib bot client:
     download to disk (user client) → upload from disk (bot client).
     PTB is used ONLY for progress-bar message edits (separate HTTP
-    rate-limit bucket), never for file payloads. > 2 GiB files are split
-    into 2 GiB parts.
+    rate-limit bucket), never for file payloads. Files larger than ~1.98 GiB
+    are streamed into ~1.98 GiB parts (never loaded into RAM) so a 3.91 GB
+    video becomes part 1 + part 2 without OOMing the dyno.
   • Real-time checkpointing + commit-pointer semantics unchanged — a failed
     message is NEVER skipped; the run stops and auto-resume retries it.
 
@@ -55,8 +56,9 @@ import database as db
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 
-SPLIT_THRESHOLD     = config.SPLIT_FILE_THRESHOLD   # exactly 2 GiB
+SPLIT_THRESHOLD     = config.SPLIT_FILE_THRESHOLD   # 2030 MiB ≈ 1.98 GiB — under Telegram's 2 GiB bot cap
 GET_MESSAGES_BATCH  = 100    # TDLib getMessages() practical ceiling per call
+SPLIT_COPY_CHUNK    = 8 * 1024 * 1024   # 8 MiB — stream split, never load a whole part into RAM
 
 
 # ── SMALL HELPERS ─────────────────────────────────────────────────────────────
@@ -171,6 +173,187 @@ def _cleanup_temp(path):
                 pass
     except Exception:
         pass
+
+
+def stream_copy_range(src_path: str, dest_path: str, offset: int, length: int) -> int:
+    """Copy `length` bytes from src_path at `offset` to dest_path in 8 MiB chunks.
+
+    Never reads a whole ~2 GB part into RAM — that OOMs 1 GB dynos and is why
+    large-file split used to freeze the worker.
+    """
+    os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
+    written = 0
+    with open(src_path, 'rb') as src, open(dest_path, 'wb') as dst:
+        src.seek(offset)
+        remaining = length
+        while remaining > 0:
+            chunk = src.read(min(SPLIT_COPY_CHUNK, remaining))
+            if not chunk:
+                break
+            dst.write(chunk)
+            written += len(chunk)
+            remaining -= len(chunk)
+    return written
+
+
+def _part_caption(base: str, part_num: int) -> str:
+    base = (base or "").rstrip()
+    if base:
+        return f"{base}\n\npart {part_num}"
+    return f"part {part_num}"
+
+
+async def _relocate_file(src_path: str, dest_path: str) -> str:
+    """Move a downloaded file onto dest_path without doubling disk (copy+keep)."""
+    os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
+    if os.path.abspath(src_path) == os.path.abspath(dest_path):
+        return dest_path
+    try:
+        await asyncio.to_thread(os.replace, src_path, dest_path)
+    except OSError:
+        await asyncio.to_thread(shutil.copyfile, src_path, dest_path)
+        try:
+            os.remove(src_path)
+        except OSError:
+            pass
+    return dest_path
+
+
+def _ensure_jpeg_thumb(src_path: str, dest_path: str) -> str:
+    """Normalize a thumbnail to JPEG so Telegram doesn't show a blank cover."""
+    try:
+        from PIL import Image
+        os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
+        with Image.open(src_path) as im:
+            im = im.convert('RGB')
+            w, h = im.size
+            max_side = 320
+            resample = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS', 1)
+            if w > 0 and h > 0 and max(w, h) > max_side:
+                if w >= h:
+                    nw, nh = max_side, max(1, int(h * max_side / w))
+                else:
+                    nh, nw = max_side, max(1, int(w * max_side / h))
+                im = im.resize((nw, nh), resample)
+            im.save(dest_path, 'JPEG', quality=85, optimize=True)
+        return dest_path
+    except Exception as e:
+        config.logger.warning(f"thumb jpeg convert failed: {e}")
+        if os.path.abspath(src_path) != os.path.abspath(dest_path):
+            try:
+                os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
+                shutil.copyfile(src_path, dest_path)
+                return dest_path
+            except Exception:
+                return src_path
+        return src_path
+
+
+def _thumb_media_obj(message):
+    c = getattr(message, 'content', None)
+    name = _cname(c)
+    if name == 'MessageVideo':
+        return getattr(c, 'video', None)
+    if name == 'MessageAnimation':
+        return getattr(c, 'animation', None)
+    if name == 'MessageVideoNote':
+        return getattr(c, 'video_note', None)
+    if name == 'MessageDocument':
+        return getattr(c, 'document', None)
+    if name == 'MessageAudio':
+        return getattr(c, 'audio', None)
+    return None
+
+
+async def _copy_tdlib_file(client, tfile, dest_path: str) -> bool:
+    """Save a TDLib File object to dest_path. Prefer local path, else download by id."""
+    if tfile is None:
+        return False
+    os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
+    local = getattr(tfile, 'local', None)
+    local_path = getattr(local, 'path', None) if local else None
+    if local_path and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        await asyncio.to_thread(shutil.copyfile, local_path, dest_path)
+        return True
+    file_id = getattr(tfile, 'id', None)
+    if file_id is not None:
+        try:
+            res = await asyncio.wait_for(
+                client.downloadFile(
+                    file_id=file_id, priority=32, offset=0, limit=0, synchronous=True
+                ),
+                timeout=60,
+            )
+            if not config.is_error(res):
+                src = getattr(getattr(res, 'local', None), 'path', None)
+                if src and os.path.exists(src) and os.path.getsize(src) > 0:
+                    if os.path.abspath(src) != os.path.abspath(dest_path):
+                        await asyncio.to_thread(shutil.copyfile, src, dest_path)
+                    return True
+        except Exception as e:
+            config.logger.warning(f"thumb file download failed: {e}")
+    remote = getattr(tfile, 'remote', None)
+    remote_id = getattr(remote, 'id', None) if remote else None
+    if remote_id:
+        try:
+            await td_download_remote_id(client, remote_id, dest_path)
+            return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+        except Exception as e:
+            config.logger.warning(f"thumb remote download failed: {e}")
+    return False
+
+
+async def _save_source_thumbnail(client, message, dest_path: str):
+    """Best-effort copy of the source media's thumbnail to a JPEG on disk.
+
+    Tries, in order: already-local TDLib file, download by file id, cover photo
+    (newer TDLib), then minithumbnail JPEG bytes. Converts to JPEG so Telegram
+    doesn't render a blank destination thumb.
+    """
+    raw_path = dest_path + ".raw"
+    media = _thumb_media_obj(message)
+    if media is None:
+        return None
+
+    got = False
+    thumb = getattr(media, 'thumbnail', None)
+    tfile = getattr(thumb, 'file', None) if thumb is not None else None
+    got = await _copy_tdlib_file(client, tfile, raw_path)
+
+    if not got:
+        cover = getattr(media, 'cover', None)
+        sizes = getattr(cover, 'sizes', None) or []
+        if sizes:
+            best = sizes[-1]
+            pfile = getattr(best, 'photo', None) or getattr(best, 'file', None)
+            got = await _copy_tdlib_file(client, pfile, raw_path)
+
+    if not got:
+        mini = getattr(media, 'minithumbnail', None)
+        data = getattr(mini, 'data', None) if mini is not None else None
+        if data:
+            try:
+                if isinstance(data, str):
+                    import base64
+                    data = base64.b64decode(data)
+                os.makedirs(os.path.dirname(raw_path) or '/tmp', exist_ok=True)
+                with open(raw_path, 'wb') as f:
+                    f.write(data)
+                got = os.path.exists(raw_path) and os.path.getsize(raw_path) > 0
+            except Exception as e:
+                config.logger.warning(f"minithumbnail write failed: {e}")
+
+    if not got:
+        return None
+    jpeg_path = _ensure_jpeg_thumb(raw_path, dest_path)
+    try:
+        if os.path.abspath(raw_path) != os.path.abspath(jpeg_path) and os.path.exists(raw_path):
+            os.remove(raw_path)
+    except Exception:
+        pass
+    if jpeg_path and os.path.exists(jpeg_path) and os.path.getsize(jpeg_path) > 0:
+        return jpeg_path
+    return None
 
 
 def _as_sent_message(sent):
@@ -624,6 +807,8 @@ async def td_download(client, message, dest_path: str, tracker=None) -> str:
     file_id    = getattr(media_file, 'id', None)
     if file_id is None:
         raise RuntimeError("message has no downloadable file")
+    expected = get_media_file_size(message)
+    attempt_cap = max(7200.0, min((expected or 0) / (200 * 1024) + 600.0, 8 * 3600.0))
     if tracker:
         watch_file(file_id, tracker, 'download')
     try:
@@ -666,8 +851,10 @@ async def td_download(client, message, dest_path: str, tracker=None) -> str:
                             f"download stalled at {cur} bytes for "
                             f"{config.DOWNLOAD_STALL_TIMEOUT}s"
                         )
-                    if time.time() - started > 7200:   # absolute cap per attempt
-                        raise TimeoutError("download exceeded 2h cap")
+                    if time.time() - started > attempt_cap:
+                        raise TimeoutError(
+                            f"download exceeded {attempt_cap:.0f}s cap"
+                        )
                     await asyncio.sleep(5)
 
                 src_path = getattr(local, 'path', None)
@@ -675,7 +862,7 @@ async def td_download(client, message, dest_path: str, tracker=None) -> str:
                     raise RuntimeError("downloadFile completed but no local path")
                 os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
                 if os.path.abspath(src_path) != os.path.abspath(dest_path):
-                    shutil.copyfile(src_path, dest_path)
+                    await _relocate_file(src_path, dest_path)
                 if attempt > 1:
                     config.logger.info(f"✅ Download succeeded on attempt {attempt}")
                 return dest_path
@@ -718,7 +905,8 @@ async def td_download_remote_id(client, remote_file_id: str, dest_path: str) -> 
     if not src_path or not os.path.exists(src_path):
         raise RuntimeError("thumbnail download produced no file")
     if os.path.abspath(src_path) != os.path.abspath(dest_path):
-        shutil.copyfile(src_path, dest_path)
+        os.makedirs(os.path.dirname(dest_path) or '/tmp', exist_ok=True)
+        await asyncio.to_thread(shutil.copyfile, src_path, dest_path)
     return dest_path
 
 
@@ -958,11 +1146,18 @@ async def _bot_disk_upload(
     from pytdbot import types
 
     thumb = None
-    if thumb_path and os.path.exists(str(thumb_path)):
+    if thumb_path and os.path.exists(str(thumb_path)) and os.path.getsize(str(thumb_path)) > 0:
+        tw, th = 0, 0
+        try:
+            from PIL import Image
+            with Image.open(str(thumb_path)) as im:
+                tw, th = im.size
+        except Exception:
+            tw, th = 320, 180
         thumb = types.InputThumbnail(
             thumbnail=types.InputFileLocal(path=str(thumb_path)),
-            width=width or 0,
-            height=height or 0,
+            width=tw or 0,
+            height=th or 0,
         )
 
     topic          = _topic_kw(dest_topic_id)
@@ -1210,6 +1405,7 @@ async def transfer_process(
         try:
             custom_thumb_path = f"/tmp/custom_thumb_{user_id}_{int(time.time())}.jpg"
             await td_download_remote_id(bot_client, thumbnail_file_id, custom_thumb_path)
+            custom_thumb_path = _ensure_jpeg_thumb(custom_thumb_path, custom_thumb_path)
             config.logger.info(f"✅ Custom thumbnail ready (disk): {custom_thumb_path}")
         except Exception as e:
             config.logger.warning(f"Custom thumbnail download failed: {e}")
@@ -1563,6 +1759,8 @@ async def transfer_process(
                 # ══ PATH B: Non-image files (videos, docs, audio…) ════════
                 # EVERY file, any size: TDLib user-client downloads to disk,
                 # TDLib bot-client uploads from disk. No PTB for payloads.
+                # Files larger than SPLIT_THRESHOLD (~1.98 GiB) are streamed
+                # into parts — never loaded whole into RAM.
                 elif not (is_photo or is_image):
                     progress_tracker = TransferProgress(
                         file_name, file_size, status_message, session_data,
@@ -1574,12 +1772,14 @@ async def transfer_process(
 
                     temp_path = _named_temp_path(user_id, message.id, file_name)
 
-                    # Video's own thumbnail (custom thumb takes priority)
-                    if is_video_mode and auto_thumb_remote and not custom_thumb_path:
+                    # Source thumbnail (custom thumb takes priority).
+                    # Don't rely only on remote.id — some videos have a local
+                    # thumb, a cover photo, or only minithumbnail bytes.
+                    if not custom_thumb_path:
                         try:
-                            thumb_path = f"/tmp/thumb_{user_id}_{message.id}.jpg"
-                            await td_download_remote_id(
-                                user_client, auto_thumb_remote, thumb_path,
+                            thumb_path = await _save_source_thumbnail(
+                                user_client, message,
+                                f"/tmp/thumb_{user_id}_{message.id}.jpg",
                             )
                         except Exception as thumb_e:
                             config.logger.warning(f"Auto-thumb fetch failed: {thumb_e}")
@@ -1587,68 +1787,102 @@ async def transfer_process(
 
                     effective_thumb = custom_thumb_path or thumb_path
 
-                    if file_size > SPLIT_THRESHOLD:
-                        # ── Split upload for very large files ─────────
-                        downloaded = await td_download(
-                            user_client, message, temp_path,
-                            tracker=progress_tracker,
+                    downloaded = await td_download(
+                        user_client, message, temp_path,
+                        tracker=progress_tracker,
+                    )
+                    if not downloaded or not os.path.exists(str(downloaded)):
+                        raise RuntimeError("download returned empty path")
+                    temp_path   = str(downloaded)
+                    actual_size = os.path.getsize(temp_path)
+
+                    if actual_size > SPLIT_THRESHOLD:
+                        parts = math.ceil(actual_size / SPLIT_THRESHOLD)
+                        config.logger.info(
+                            f"✂️ Splitting {human_readable_size(actual_size)} "
+                            f"into {parts} parts of up to "
+                            f"{human_readable_size(SPLIT_THRESHOLD)}"
                         )
-                        actual_size = os.path.getsize(str(downloaded))
-                        parts       = math.ceil(actual_size / SPLIT_THRESHOLD)
-                        config.logger.info(f"✂️ Splitting into {parts} parts")
+                        await safe_edit_message(
+                            status_message,
+                            _progress_text(
+                                f"✂️ **Splitting** `{file_name[:35]}`",
+                                f"\n{human_readable_size(actual_size)} → {parts} parts"
+                            ),
+                            reply_markup=get_progress_keyboard(),
+                        )
 
                         all_parts_ok = True
-                        with open(str(downloaded), 'rb') as full_file:
-                            for i in range(parts):
-                                if await _should_stop():
-                                    all_parts_ok = False
-                                    break
-                                part_num  = i + 1
-                                part_name = (
-                                    f"{os.path.splitext(file_name)[0]}"
-                                    f".part{part_num:03d}"
-                                    f"{os.path.splitext(file_name)[1]}"
+                        offset = 0
+                        for i in range(parts):
+                            if await _should_stop():
+                                all_parts_ok = False
+                                break
+                            part_num = i + 1
+                            this_len = min(SPLIT_THRESHOLD, actual_size - offset)
+                            part_name = (
+                                f"{os.path.splitext(file_name)[0]}"
+                                f".part{part_num}"
+                                f"{os.path.splitext(file_name)[1]}"
+                            )
+                            part_path = _named_temp_path(
+                                user_id, f"{message.id}_p{i}", part_name
+                            )
+                            written = await asyncio.to_thread(
+                                stream_copy_range,
+                                temp_path, part_path, offset, this_len,
+                            )
+                            offset += written
+                            if written <= 0:
+                                config.logger.error(
+                                    f"Split part {part_num} wrote 0 bytes"
                                 )
-                                part_path = _named_temp_path(
-                                    user_id, f"{message.id}_p{i}", part_name
-                                )
-                                part_data = full_file.read(SPLIT_THRESHOLD)
-                                with open(part_path, 'wb') as pf:
-                                    pf.write(part_data)
+                                all_parts_ok = False
+                                break
 
-                                part_cap = f"{modified_caption}\n\n(Part {part_num}/{parts})"
-                                part_tracker = TransferProgress(
-                                    part_name, len(part_data),
-                                    status_message, session_data,
-                                    msg_id=message.id,
+                            part_cap = _part_caption(modified_caption, part_num)
+                            part_tracker = TransferProgress(
+                                part_name, written,
+                                status_message, session_data,
+                                msg_id=message.id,
+                            )
+                            part_tracker.reset_for_upload()
+                            await safe_edit_message(
+                                status_message,
+                                _progress_text(
+                                    f"📤 **Uploading part {part_num}/{parts}**",
+                                    f"\n`{part_name[:40]}` · {human_readable_size(written)}"
+                                ),
+                                reply_markup=get_progress_keyboard(),
+                            )
+                            part_ok, part_sent = await _bot_disk_upload(
+                                bot_client, dest_id,
+                                part_path, part_name, written,
+                                part_cap,
+                                is_video=False, is_audio=False,
+                                thumb_path=effective_thumb,
+                                dest_topic_id=dest_topic_id,
+                                progress_tracker=part_tracker,
+                            )
+                            if part_ok and log_channel:
+                                await log_transfer(
+                                    bot_client, log_channel, part_sent,
+                                    session_id, dest_id, part_name,
+                                    part_num=part_num,
+                                    file_path=part_path,
+                                    caption=part_cap,
                                 )
-                                part_tracker.reset_for_upload()
-                                part_ok, part_sent = await _bot_disk_upload(
-                                    bot_client, dest_id,
-                                    part_path, part_name, len(part_data),
-                                    part_cap,
-                                    is_video=False, is_audio=False,
-                                    thumb_path=None,
-                                    dest_topic_id=dest_topic_id,
-                                    progress_tracker=part_tracker,
-                                )
-                                if part_ok and log_channel:
-                                    await log_transfer(
-                                        bot_client, log_channel, part_sent,
-                                        session_id, dest_id, part_name,
-                                        part_num=part_num,
-                                        file_path=part_path,
-                                        caption=part_cap,
-                                    )
-                                part_tracker.invalidate()
-                                _cleanup_temp(part_path)
+                            part_tracker.invalidate()
+                            _cleanup_temp(part_path)
 
-                                if not part_ok:
-                                    all_parts_ok = False
-                                    break
+                            if not part_ok:
+                                all_parts_ok = False
+                                break
 
-                        try: _cleanup_temp(str(downloaded))
-                        except Exception: pass
+                        try:
+                            _cleanup_temp(temp_path)
+                        except Exception:
+                            pass
                         temp_path = None
 
                         if all_parts_ok:
@@ -1656,22 +1890,13 @@ async def transfer_process(
                             sent_message = True
 
                     else:
-                        # ── Normal disk download → upload ──────────────
-                        downloaded = await td_download(
-                            user_client, message, temp_path,
-                            tracker=progress_tracker,
-                        )
-                        if not downloaded or not os.path.exists(str(downloaded)):
-                            raise RuntimeError("download returned empty path")
-                        temp_path = str(downloaded)
-
                         # Instantly flip the bar to the upload phase so it
                         # never looks stuck on the last download frame.
                         progress_tracker.reset_for_upload()
 
                         ok, sent_message = await _bot_disk_upload(
                             bot_client, dest_id,
-                            temp_path, file_name, file_size,
+                            temp_path, file_name, actual_size or file_size,
                             modified_caption,
                             is_video=is_video_mode,
                             is_audio=is_audio,

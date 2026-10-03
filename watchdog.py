@@ -15,10 +15,9 @@ Two jobs, run on a timer from main.py:
      watchdog's `status == 'running'` filter skips it entirely.
 
   2. EXPIRY CLEANUP
-     Once a user's subscription is no longer valid, their checkpoint/task
-     records are wiped so nothing stale lingers in Mongo. Active subscribers
-     are never touched — their progress record stays exact and durable for
-     as long as their subscription lasts.
+     Once a user's subscription is no longer valid, their checkpoint, task,
+     dyno record, TDLib session archive, phone and password are wiped so
+     Mongo doesn't keep growing. Active subscribers are never touched.
 """
 
 import uuid
@@ -142,18 +141,23 @@ async def auto_resume_stale_tasks() -> None:
 
 async def cleanup_expired_subscriptions() -> None:
     try:
-        affected = await db.cleanup_expired_subscription_data()
-        if not affected:
-            return
+        # Kill leftover dynos BEFORE wiping their Mongo records, otherwise
+        # purge deletes the dyno_name and we can never stop the one-off.
         if HEROKU_MODE:
-            for uid in affected:
-                dyno_rec = await db.get_user_dyno(uid)
-                if dyno_rec and dyno_rec.get('dyno_name'):
+            for rec in await db.get_all_dynos():
+                uid = rec.get('user_id')
+                if not uid:
+                    continue
+                is_valid, _, _ = await db.check_user(uid)
+                if is_valid:
+                    continue
+                name = rec.get('dyno_name')
+                if name:
                     try:
-                        await heroku_manager.kill_dyno(dyno_rec['dyno_name'])
+                        await heroku_manager.kill_dyno(name)
                     except Exception:
                         pass
-                await db.clear_user_dyno(uid)
+        await db.cleanup_expired_subscription_data()
     except Exception as e:
         config.logger.error(f"Watchdog cleanup error: {e}", exc_info=True)
 

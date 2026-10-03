@@ -75,12 +75,14 @@ UPLOAD_PROGRESS_INTERVAL   = 8   # seconds between upload progress edits
 #
 # HARD PLATFORM CEILING — NOT configurable, not a bug:
 #   A bot account can NEVER hold Telegram Premium, so Telegram enforces a hard
-#   ~2 GiB per-file cap for bot uploads. SPLIT_FILE_THRESHOLD is hardcoded to
-#   EXACTLY 2 GiB: any file <= 2 GiB goes through as ONE single file; only
-#   files STRICTLY LARGER get chunked into parts.
+#   ~2 GiB per-file cap for bot uploads. We split at 2030 MiB (~1.98 GiB) so
+#   each part stays safely under 2 GiB (exactly 2 GiB = 2147483648 is 1 byte
+#   over INT32_MAX and Telegram rejects it). A ~3.91 GB video therefore
+#   becomes part 1 (~1.98 GB) + part 2 (the rest).
+#   Files <= 2030 MiB go through as ONE single file.
 #
 PTB_SMALL_FILE_LIMIT  = 45  * 1024 * 1024    # 45 MB
-SPLIT_FILE_THRESHOLD  = 2 * 1024 * 1024 * 1024   # exactly 2 GiB — hardcoded per request
+SPLIT_FILE_THRESHOLD  = 2030 * 1024 * 1024   # 2030 MiB ≈ 1.98 GiB — near 2 GB, always under cap
 
 # ── DOWNLOAD STALL PROTECTION ─────────────────────────────────────────────────
 # TDLib synchronous downloadFile can hang forever on a server-side stall, so

@@ -204,10 +204,14 @@ async def place_new_purchase(user_id: int, duration_seconds: int, bot_client) ->
     # Now that the subscription safely lives on the target bot, stop
     # anything running here and wipe it locally so it's never double-counted.
     _cancel_local_sessions(user_id)
+    try:
+        dyno_rec = await db.get_user_dyno(user_id)
+        if dyno_rec and dyno_rec.get('dyno_name'):
+            from heroku_manager import heroku_manager
+            await heroku_manager.kill_dyno(dyno_rec['dyno_name'])
+    except Exception:
+        pass
     await db.revoke_user(user_id)
-    await db.cancel_all_active_tasks(user_id)
-    await db.clear_all_task_data(user_id)
-    await db.clear_user_dyno(user_id)
 
     # Best-effort — reflect the count change immediately rather than waiting
     # for the next periodic watchdog tick.
