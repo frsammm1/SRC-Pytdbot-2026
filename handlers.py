@@ -923,15 +923,36 @@ def register_handlers(bot_client):
 
         dyno_rec = await db.get_user_dyno(user_id)
         if dyno_rec and dyno_rec.get('status') == 'running':
-            dyno_name = dyno_rec.get('dyno_name', 'Unknown')
-            await _reply(message,
-                f"Transfer already running!\n\n"
-                f"Active Dyno: `{dyno_name}`\n\n"
-                f"`/stop` — Stop and kill dyno\n"
-                f"`/kill` — Force kill if stuck\n\n"
-                f"Then use `/clone` again."
+            # Self-heal: dyno records of dead workers (killed before their
+            # cleanup ran) would block the user forever. If the dyno stopped
+            # pinging, clear the stale record and let /clone proceed.
+            last_activity = max(
+                dyno_rec.get('last_ping') or 0,
+                dyno_rec.get('started_at') or 0,
             )
-            return
+            if time.time() - last_activity > config.DYNO_STALE_THRESHOLD:
+                config.logger.warning(
+                    f"clone_init: stale dyno record for user {user_id} — auto-clearing"
+                )
+                cancel_existing_sessions(user_id)
+                await db.cancel_all_active_tasks(user_id)
+                try:
+                    old_dyno = dyno_rec.get('dyno_name')
+                    if old_dyno:
+                        await heroku_manager.kill_dyno(old_dyno)
+                except Exception:
+                    pass
+                await db.clear_user_dyno(user_id)
+            else:
+                dyno_name = dyno_rec.get('dyno_name', 'Unknown')
+                await _reply(message,
+                    f"Transfer already running!\n\n"
+                    f"Active Dyno: `{dyno_name}`\n\n"
+                    f"`/stop` — Stop and kill dyno\n"
+                    f"`/kill` — Force kill if stuck\n\n"
+                    f"Then use `/clone` again."
+                )
+                return
 
         checkpoint = await db.get_transfer_checkpoint(user_id)
         if checkpoint:
@@ -1478,6 +1499,14 @@ def register_handlers(bot_client):
                 dest_id = getattr(origin, 'sender_chat_id', None)
             elif o_name == 'MessageOriginUser':
                 dest_id = getattr(origin, 'sender_user_id', None)
+            elif o_name == 'MessageOriginHiddenUser':
+                # Forwarded from a user with hidden forwards — no ID available.
+                await _reply(message,
+                    "❌ Is user ne apna account forward se hidden kiya hai, ID nahi mil payi.\n\n"
+                    "Numeric ID bhejo: `123456789`\n"
+                    "Ya destination channel/group se koi message forward karo."
+                )
+                return
 
             if dest_id is None:
                 text = message_plain_text(message).strip()
@@ -1992,6 +2021,15 @@ def register_handlers(bot_client):
             user_id       = session['user_id']
             dest_topic_id = session.get('dest_topic_id')
 
+            # Double-tap guard: a second Start press while the first one is
+            # still awaiting (DB / Heroku API) would spawn TWO dynos for the
+            # same user → AUTH_KEY_DUPLICATED. Set the flag synchronously.
+            if session.get('starting'):
+                try: await query.answer("⏳ Transfer pehle se start ho raha hai…")
+                except Exception: pass
+                return
+            session['starting'] = True
+
             _, user_session, _ = await db.check_user(user_id)
             if not user_session:
                 await _safe_cb_edit(query, "❌ Session lost. Use /login again.")
@@ -2027,6 +2065,20 @@ def register_handlers(bot_client):
                     dyno_name  = dyno_data['name']
                     first_name = await get_sender_name(client, user_id)
                     await db.register_user_dyno(user_id, dyno_name, task_id, first_name)
+
+                    # User cancelled (or started a new /clone) while the dyno
+                    # was being spawned — kill it instead of leaving an orphan.
+                    if sid not in config.active_sessions:
+                        config.logger.warning(
+                            f"start_cb: session {sid} gone after spawn — killing {dyno_name}"
+                        )
+                        try: await heroku_manager.kill_dyno(dyno_name)
+                        except Exception: pass
+                        try: await db.request_task_stop(task_id)
+                        except Exception: pass
+                        await db.clear_user_dyno(user_id, task_id=task_id)
+                        return
+
                     topic_line = f"\nDest Topic: `{dest_topic_id}`" if dest_topic_id else ""
                     thumb_line = "\n🖼️ Custom Thumbnail: ✅" if session.get('settings', {}).get('thumbnail_set') else ""
                     total_msgs = session['end_msg'] - session['start_msg'] + 1
@@ -2106,6 +2158,9 @@ def register_handlers(bot_client):
             if not checkpoint:
                 await _safe_cb_edit(query, "❌ Checkpoint expired.")
                 return
+            # Consume the checkpoint immediately — a double-tap on Resume
+            # would otherwise spawn two dynos for the same range.
+            await db.clear_transfer_checkpoint(user_id)
             _, user_session, _ = await db.check_user(user_id)
             if not user_session:
                 await _safe_cb_edit(query, "❌ Not logged in. Use /login first.")
@@ -2192,7 +2247,10 @@ def register_handlers(bot_client):
                 )
             except Exception as e:
                 config.active_sessions.pop(session_id, None)
-                await _safe_cb_edit(query, f"❌ Failed to resume: {e}")
+                # Resume failed — restore the checkpoint so the user can retry.
+                try: await db.save_transfer_checkpoint(user_id, checkpoint)
+                except Exception: pass
+                await _safe_cb_edit(query, f"❌ Failed to resume: {e}\n\nCheckpoint saved — Resume try kar sakte ho.")
 
         except Exception as e:
             config.logger.error(f"resume_checkpoint_cb error: {e}", exc_info=True)

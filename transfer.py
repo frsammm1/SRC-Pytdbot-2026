@@ -808,6 +808,28 @@ async def td_download(client, message, dest_path: str, tracker=None) -> str:
     if file_id is None:
         raise RuntimeError("message has no downloadable file")
     expected = get_media_file_size(message)
+
+    # Disk preflight: 2GB+ files need room for the original AND the split
+    # parts at the same time. Fail fast with a clear error instead of
+    # stalling mid-upload when the dyno's ephemeral disk fills up.
+    if expected:
+        try:
+            need = (
+                expected
+                + (SPLIT_THRESHOLD if expected > SPLIT_THRESHOLD else 0)
+                + 300 * 1024 * 1024
+            )
+            free = shutil.disk_usage(os.path.dirname(dest_path) or '/tmp').free
+            if free < need:
+                raise RuntimeError(
+                    f"dyno disk full: need ~{need // (1024 ** 2)}MiB, "
+                    f"only {free // (1024 ** 2)}MiB free"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
     attempt_cap = max(7200.0, min((expected or 0) / (200 * 1024) + 600.0, 8 * 3600.0))
     if tracker:
         watch_file(file_id, tracker, 'download')

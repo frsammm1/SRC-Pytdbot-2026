@@ -36,16 +36,26 @@ async def auto_resume_stale_tasks() -> None:
         return  # in-process fallback mode has no separate dynos to watch
 
     # Two failure shapes, one recovery path:
-    #  - 'running' but silent  → dyno crashed/OOM-killed without cleanup
+    #  - 'running'/'pending' but silent → dyno crashed/OOM-killed/never booted
     #  - 'retry_pending', due  → worker exited cleanly but gave up early
     #    (5 consecutive failures, preflight issue, internal crash)
     tasks = await db.get_stale_running_tasks(config.DYNO_STALE_THRESHOLD)
     tasks += await db.get_due_retry_tasks()
 
+    resumed_users = set()   # ONE resume per user per sweep — never two dynos
+
     for task in tasks:
         user_id     = task.get('user_id')
         old_task_id = task.get('task_id')
         try:
+            # Same user queued twice (e.g. two failed tasks both due)? Keep
+            # the FIRST (oldest → most-behind) and supersede the rest —
+            # spawning both would open the same TDLib session twice
+            # (AUTH_KEY_DUPLICATED) and kill both dynos.
+            if user_id in resumed_users:
+                await db.update_task_status(old_task_id, 'superseded')
+                continue
+
             # Defense in depth: if this user's CURRENT dyno record points at
             # a DIFFERENT, newer task_id, this task has already been
             # superseded (a manual /clone, resume, or /stop→restart started
@@ -59,6 +69,12 @@ async def auto_resume_stale_tasks() -> None:
                 await db.update_task_status(old_task_id, 'superseded')
                 continue
 
+            # Atomic claim: if the status changed underneath us (user /stop,
+            # another sweep, a manual restart), back off immediately.
+            if not await db.claim_stale_task_for_resume(old_task_id):
+                continue
+            resumed_users.add(user_id)
+
             is_valid, _, _ = await db.check_user(user_id)
             if not is_valid:
                 # Subscription lapsed mid-transfer — leave it for the expiry
@@ -67,33 +83,53 @@ async def auto_resume_stale_tasks() -> None:
                 continue
 
             checkpoint = await db.get_transfer_checkpoint(user_id)
-            if not checkpoint:
+            task_data  = task.get('data') or {}
+
+            # A checkpoint only helps if it describes THIS transfer (same
+            # source/dest/end). A dyno that died before its first checkpoint
+            # (or with a stale checkpoint from an older run) resumes from the
+            # task's own range instead of being marked failed and leaving the
+            # user stuck on "Transfer Started!" forever.
+            def _ckpt_matches(ckpt) -> bool:
+                try:
+                    return (
+                        ckpt
+                        and str(ckpt.get('source_id')) == str(task_data.get('source_id'))
+                        and str(ckpt.get('dest_id'))   == str(task_data.get('dest_id'))
+                        and int(ckpt.get('end_msg', -1)) == int(task_data.get('end_msg', -2))
+                    )
+                except Exception:
+                    return False
+
+            ckpt      = checkpoint if _ckpt_matches(checkpoint) else None
+            base      = ckpt if ckpt else task_data
+            start_msg = (int(ckpt.get('current_msg', 0)) + 1) if ckpt \
+                        else int(task_data.get('start_msg', 0))
+            end_msg   = int(base.get('end_msg', 0))
+
+            if not end_msg:
+                await db.update_task_status(old_task_id, 'failed')
+                continue
+            if start_msg > end_msg:
+                await db.update_task_status(old_task_id, 'done')
+                if ckpt:
+                    await db.clear_transfer_checkpoint(user_id)
+                continue
+
+            chat_id = base.get('chat_id') or task_data.get('chat_id')
+            if not chat_id:
+                config.logger.warning(
+                    f"Watchdog: task {old_task_id} for user {user_id} has no chat_id — "
+                    f"can't auto-resume safely, skipping."
+                )
                 await db.update_task_status(old_task_id, 'failed')
                 continue
 
-            start_msg = int(checkpoint.get('current_msg', 0)) + 1
-            end_msg   = int(checkpoint.get('end_msg', 0))
-            if start_msg > end_msg:
-                await db.update_task_status(old_task_id, 'done')
-                await db.clear_transfer_checkpoint(user_id)
-                continue
-
-            chat_id = checkpoint.get('chat_id')
-            if not chat_id:
-                config.logger.warning(
-                    f"Watchdog: checkpoint for user {user_id} has no chat_id — "
-                    f"can't auto-resume safely, skipping."
-                )
-                continue
-
             # Checkpoints store source_id/dest_id as strings (safe for Mongo).
-            # Pyrogram treats a string chat-id argument as a USERNAME to
-            # resolve, not a numeric peer ID — so passing the raw string
-            # straight into a fresh dyno's get_chat()/get_messages() fails
-            # with PeerIdInvalid/"could not access channel" even for an
-            # account that's genuinely a member. Numeric IDs MUST be ints.
-            raw_source_id = checkpoint.get('source_id')
-            raw_dest_id   = checkpoint.get('dest_id')
+            # TDLib/Pyrogram treat a string chat-id as a USERNAME to resolve,
+            # not a numeric peer ID. Numeric IDs MUST be ints.
+            raw_source_id = base.get('source_id')
+            raw_dest_id   = base.get('dest_id')
             source_id = raw_source_id
             try:
                 if str(raw_source_id).lstrip('-').isdigit():
@@ -105,32 +141,49 @@ async def auto_resume_stale_tasks() -> None:
             except Exception:
                 dest_id = raw_dest_id
 
+            # The stale dyno may be HUNG, not dead — still holding the user's
+            # TDLib session. Kill it by name first and give Telegram a moment
+            # to drop the old connection, otherwise the fresh dyno opens the
+            # same auth key and both die with AUTH_KEY_DUPLICATED.
+            old_dyno_name = (current_dyno or {}).get('dyno_name')
+            if old_dyno_name:
+                try:
+                    await heroku_manager.kill_dyno(old_dyno_name)
+                    await asyncio.sleep(8)
+                except Exception:
+                    pass
+
             new_task_id = str(uuid.uuid4())
-            task_data = {
+            new_task_data = {
                 'chat_id':       chat_id,
                 'source_id':     source_id,
                 'dest_id':       dest_id,
                 'start_msg':     start_msg,
                 'end_msg':       end_msg,
                 'session_id':    str(uuid.uuid4()),
-                'log_channel':   checkpoint.get('log_channel'),
-                'topic_id':      checkpoint.get('topic_id'),
-                'dest_topic_id': checkpoint.get('dest_topic_id'),
-                'settings':      checkpoint.get('settings', {}),
-                'start_link':    checkpoint.get('source_link'),
+                'log_channel':   base.get('log_channel') or task_data.get('log_channel'),
+                'topic_id':      base.get('topic_id'),
+                'dest_topic_id': base.get('dest_topic_id'),
+                'settings':      base.get('settings', {}),
+                'start_link':    base.get('source_link') or task_data.get('start_link'),
             }
-            await db.create_transfer_task(new_task_id, user_id, task_data)
+            await db.create_transfer_task(new_task_id, user_id, new_task_data)
             dyno_data = await heroku_manager.spawn_user_dyno(user_id, new_task_id)
-            await db.update_task_status(old_task_id, 'superseded')
 
             if dyno_data and dyno_data.get('name'):
+                await db.update_task_status(old_task_id, 'superseded')
                 config.logger.info(
                     f"🔄 Watchdog auto-resumed user {user_id}: "
                     f"msg {start_msg}→{end_msg} on dyno {dyno_data['name']}"
                 )
             else:
+                # Spawn failed — don't strand the task: put it back on the
+                # retry queue so the next sweep tries again.
+                await db.delete_task(new_task_id)
+                await db.schedule_task_retry(old_task_id, 60)
                 config.logger.error(
-                    f"Watchdog: failed to spawn resume dyno for user {user_id}"
+                    f"Watchdog: failed to spawn resume dyno for user {user_id} "
+                    f"— retry scheduled in 60s"
                 )
 
         except Exception as e:

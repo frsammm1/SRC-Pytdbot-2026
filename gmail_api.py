@@ -15,6 +15,7 @@ Security:
   • Once claimed (on any bot), the same UTR / email msg is rejected everywhere.
 """
 
+import asyncio
 import requests
 import re
 import logging
@@ -70,7 +71,10 @@ async def verify_payment(
     except Exception as e:
         logger.warning(f"Shared DB UTR check skipped: {e}")
 
-    access_token = get_access_token()
+    # requests is synchronous — run it in a thread so the bot's event loop
+    # never freezes while Gmail API calls are in flight (this was making the
+    # whole bot unresponsive for 30s+ during payment checks).
+    access_token = await asyncio.to_thread(get_access_token)
     if not access_token:
         return False, "❌ Payment verification service unavailable. Contact admin.", None
 
@@ -80,7 +84,7 @@ async def verify_payment(
     list_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={requests.utils.quote(query)}&maxResults=30"
 
     try:
-        res      = requests.get(list_url, headers=headers, timeout=15)
+        res      = await asyncio.to_thread(requests.get, list_url, headers=headers, timeout=15)
         res.raise_for_status()
         messages = res.json().get("messages", [])
     except Exception as e:
@@ -90,24 +94,40 @@ async def verify_payment(
     if not messages:
         return False, "❌ No recent FamPay payment emails found.", None
 
+    # Filter already-claimed emails first, then fetch the rest CONCURRENTLY
+    # (sequential fetches × 30 messages × up to 15s was the main slowdown).
+    candidates = []
     for msg in messages[:30]:
         msg_id = msg["id"]
-
-        # Check if this email was already claimed (locally + shared)
         try:
             import database as db
             if await db.check_payment_claimed(msg_id):
                 continue
         except Exception:
             pass
+        candidates.append(msg_id)
 
+    sem = asyncio.Semaphore(8)
+
+    async def _fetch_snippet(msg_id: str) -> str | None:
         detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
         try:
-            detail_res = requests.get(detail_url, headers=headers, timeout=15)
+            async with sem:
+                detail_res = await asyncio.to_thread(
+                    requests.get, detail_url, headers=headers, timeout=15
+                )
             detail_res.raise_for_status()
-            detail  = detail_res.json()
-            snippet = detail.get("snippet", "")
+            return detail_res.json().get("snippet", "")
+        except Exception as e:
+            logger.error(f"Failed to fetch email {msg_id}: {e}")
+            return None
 
+    snippets = await asyncio.gather(*[_fetch_snippet(m) for m in candidates])
+
+    for msg_id, snippet in zip(candidates, snippets):
+        if snippet is None:
+            continue
+        try:
             if utr in snippet:
                 # UTR found — verify amount
                 amount_match = re.search(r'₹\s?([0-9]+(?:\.[0-9]+)?)', snippet)
@@ -137,7 +157,7 @@ async def mark_payment_claimed(msg_id: str) -> bool:
     Archive the Gmail message so it won't appear in future scans.
     Removes INBOX and UNREAD labels.
     """
-    access_token = get_access_token()
+    access_token = await asyncio.to_thread(get_access_token)
     if not access_token:
         return False
 
@@ -149,7 +169,7 @@ async def mark_payment_claimed(msg_id: str) -> bool:
     data = {"removeLabelIds": ["UNREAD", "INBOX"]}
 
     try:
-        res = requests.post(url, headers=headers, json=data, timeout=15)
+        res = await asyncio.to_thread(requests.post, url, headers=headers, json=data, timeout=15)
         res.raise_for_status()
         logger.info(f"✅ Email {msg_id} archived (removed from INBOX)")
         return True

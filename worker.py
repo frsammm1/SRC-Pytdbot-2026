@@ -253,7 +253,7 @@ async def worker_preflight_source(user_client, source_id, chat_id: int, bot_clie
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
-async def main(user_id: int, task_id: str):
+async def _run(user_id: int, task_id: str):
     logger.info(f"━━ Worker starting: user={user_id} task={task_id} ━━")
 
     await db.init_db()
@@ -268,6 +268,29 @@ async def main(user_id: int, task_id: str):
     chat_id       = task_data['chat_id']
     dest_id       = task_data['dest_id']
     dest_topic_id = task_data.get('dest_topic_id')
+
+    # ── Duplicate-spawn guard: only ONE worker may own a task ─────────────
+    # Double-taps / watchdog races can spawn 2 dynos for the same task.
+    # The loser must exit BEFORE opening the user session, otherwise both
+    # dynos hold the same TDLib auth key → AUTH_KEY_DUPLICATED kills both.
+    status = task.get('status')
+    if status == 'pending':
+        if not await db.claim_transfer_task(task_id):
+            logger.warning(f"⚠️ Task {task_id} already claimed by another worker — exiting")
+            return
+    elif status != 'resuming':
+        logger.warning(f"⚠️ Task {task_id} not runnable (status: {status}) — exiting")
+        return
+
+    # ── Self-supersede: a NEWER task for this user wins the session ───────
+    newer = await db.get_newer_active_task(user_id, task.get('created_at', 0), exclude_task_id=task_id)
+    if newer:
+        logger.warning(f"⚠️ Newer task {newer['task_id']} exists for user {user_id} — superseding self")
+        try:
+            await db.update_task_status(task_id, 'superseded', error='Superseded by newer task')
+        except Exception:
+            pass
+        return
 
     # ── Load user session ──────────────────────────────────────────────────
     is_valid, session_blob, phone = await db.check_user(user_id)
@@ -320,17 +343,43 @@ async def main(user_id: int, task_id: str):
         except Exception:
             pass
         await db.update_task_status(task_id, 'failed')
-        await db.clear_user_dyno(user_id)
+        await db.clear_user_dyno(user_id, task_id=task_id)
         await _shutdown_clients()
 
     # ── Connect user_client (restored TDLib session) ───────────────────────
+    # AUTH_KEY_DUPLICATED happens when a previous dyno still holds the same
+    # session open (race on restart / killed dyno not yet fully dead).
+    # Retry briefly — Telegram drops the stale connection within ~30s.
     user_client = None
     try:
-        user_client = await session_manager.start_user_session(session_blob, user_id)
-        me = await user_client.getMe()
-        if config.is_error(me) or not me:
-            raise SessionExpiredError("getMe() failed — session invalid.")
-        logger.info(f"✅ User client authorised: {me.first_name} ({me.id})")
+        for attempt in range(3):
+            try:
+                user_client = await session_manager.start_user_session(session_blob, user_id)
+                me = await user_client.getMe()
+                if config.is_error(me) or not me:
+                    err_text = str(getattr(me, 'message', '') or '')
+                    if 'AUTH_KEY_DUPLICATED' in err_text.upper():
+                        raise RuntimeError(err_text)
+                    raise SessionExpiredError("getMe() failed — session invalid.")
+                logger.info(f"✅ User client authorised: {me.first_name} ({me.id})")
+                break
+            except SessionExpiredError:
+                raise
+            except Exception as e:
+                if 'AUTH_KEY_DUPLICATED' in str(e).upper() and attempt < 2:
+                    logger.warning(
+                        f"⚠️ AUTH_KEY_DUPLICATED (attempt {attempt + 1}/3) — "
+                        "waiting 30s for the stale connection to drop…"
+                    )
+                    try:
+                        if user_client:
+                            await session_manager.stop_user_session(user_client)
+                    except Exception:
+                        pass
+                    user_client = None
+                    await asyncio.sleep(30)
+                    continue
+                raise
 
     except SessionExpiredError:
         logger.error("User session invalid/expired — exiting.")
@@ -342,6 +391,15 @@ async def main(user_id: int, task_id: str):
 
     except Exception as e:
         msg_up = str(e).upper()
+        if 'AUTH_KEY_DUPLICATED' in msg_up:
+            # Another dyno is still holding this session — do NOT fail the
+            # task; schedule a retry so the watchdog respawns us once the
+            # stale connection is gone.
+            logger.error("AUTH_KEY_DUPLICATED persists — scheduling retry in 90s")
+            await db.schedule_task_retry(task_id, 90)
+            await db.clear_user_dyno(user_id, task_id=task_id)
+            await _shutdown_clients()
+            return
         if 'USER_DEACTIVATED' in msg_up or 'BANNED' in msg_up:
             logger.error("User account deactivated/banned.")
             await _abort("❌ Your Telegram account has been deactivated or banned.")
@@ -363,7 +421,7 @@ async def main(user_id: int, task_id: str):
     preflight_ok = await worker_preflight(bot_client, dest_id, chat_id)
     if not preflight_ok:
         await db.update_task_status(task_id, 'failed')
-        await db.clear_user_dyno(user_id)
+        await db.clear_user_dyno(user_id, task_id=task_id)
         await _shutdown_clients()
         return
 
@@ -374,7 +432,7 @@ async def main(user_id: int, task_id: str):
     )
     if not source_preflight_ok:
         await db.update_task_status(task_id, 'failed')
-        await db.clear_user_dyno(user_id)
+        await db.clear_user_dyno(user_id, task_id=task_id)
         await _shutdown_clients()
         return
 
@@ -432,9 +490,28 @@ async def main(user_id: int, task_id: str):
         await db.schedule_task_retry(task_id, config.RETRY_AFTER_FAILURE_SECONDS)
 
     # ── Cleanup ────────────────────────────────────────────────────────────
-    await db.clear_user_dyno(user_id)
+    await db.clear_user_dyno(user_id, task_id=task_id)
     await _shutdown_clients()
     logger.info("━━ Worker exiting ━━")
+
+
+async def main(user_id: int, task_id: str):
+    """
+    Crash-safety wrapper around _run().
+    Any unhandled failure (dyno kill, TDLib crash, network drop, preflight
+    timeout) would otherwise leave the task stuck in 'running'/'pending'
+    forever. Instead: schedule a retry so the watchdog spawns a fresh worker.
+    """
+    try:
+        await _run(user_id, task_id)
+    except Exception as e:
+        logger.error(f"💥 Worker crashed: {e}", exc_info=True)
+        try:
+            await db.init_db()
+            await db.schedule_task_retry(task_id, config.RETRY_AFTER_FAILURE_SECONDS)
+            await db.clear_user_dyno(user_id, task_id=task_id)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

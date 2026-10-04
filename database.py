@@ -507,20 +507,34 @@ async def cleanup_expired_subscription_data() -> list:
 
 async def get_stale_running_tasks(stale_seconds: int) -> list:
     """
-    Tasks still marked 'running' whose worker dyno hasn't pinged its RAM
-    heartbeat (db.dynos.last_ping) in longer than stale_seconds — meaning the
-    one-off Heroku dyno almost certainly crashed/was killed without reaching
-    its own cleanup code. These are candidates for watchdog auto-resume.
+    Tasks marked 'running' (or stuck at 'pending') whose worker dyno hasn't
+    pinged its RAM heartbeat (db.dynos.last_ping) in longer than
+    stale_seconds — meaning the one-off Heroku dyno crashed, was killed, or
+    never booted at all, without reaching its own cleanup code. These are
+    candidates for watchdog auto-resume.
+
+    'pending' coverage matters: if a spawned dyno dies BEFORE the worker
+    marks the task running (boot crash, auth failure, slug issue), the task
+    used to sit in 'pending' forever and the user stayed stuck on
+    "Transfer Started!" with nothing happening.
     """
     if db is None: return []
     stale = []
     try:
         now = time.time()
-        async for task in db.tasks.find({'status': 'running'}):
+        async for task in db.tasks.find({'status': {'$in': ['running', 'pending']}}):
             uid  = task.get('user_id')
             dyno = await db.dynos.find_one({'user_id': uid, 'task_id': task.get('task_id')})
             last_ping = dyno.get('last_ping', 0) if dyno else 0
-            if now - last_ping > stale_seconds:
+            # Reference point: freshest of (last ping, dyno registration,
+            # task creation). A just-created task whose dyno is still booting
+            # is NOT stale yet.
+            ref = max(
+                last_ping,
+                (dyno.get('started_at', 0) if dyno else 0),
+                task.get('created_at', 0),
+            )
+            if now - ref > stale_seconds:
                 stale.append(task)
     except Exception as e:
         logger.error(f"get_stale_running_tasks error: {e}")
@@ -616,11 +630,21 @@ async def get_all_dynos() -> list:
         return []
 
 
-async def clear_user_dyno(user_id: int) -> None:
+async def clear_user_dyno(user_id: int, task_id: str = None) -> None:
+    """
+    Mark a user's dyno record stopped. When task_id is given, the record is
+    ONLY cleared if it still belongs to that task — so a superseded/duplicate
+    worker exiting late can never wipe the dyno record of the user's NEWER,
+    healthy transfer (which would make the watchdog think it died and spawn
+    a duplicate).
+    """
     if db is None: return
     try:
+        query = {'user_id': user_id}
+        if task_id:
+            query['task_id'] = task_id
         await db.dynos.update_one(
-            {'user_id': user_id},
+            query,
             {'$set': {
                 'status':    'stopped',
                 'dyno_name': None,
@@ -647,6 +671,72 @@ async def create_transfer_task(task_id: str, user_id: int, task_data: dict) -> N
 async def get_transfer_task(task_id: str) -> dict | None:
     if db is None: return None
     return await db.tasks.find_one({'task_id': task_id})
+
+
+async def claim_transfer_task(task_id: str) -> bool:
+    """
+    Atomically flip a task 'pending' → 'running'. Returns False if the task
+    was no longer pending — i.e. ANOTHER dyno already claimed it (or it was
+    stopped). This is the single-flight guard that makes the "two dynos,
+    same task" race impossible even if a double-spawn slips through.
+    """
+    if db is None: return False
+    try:
+        res = await db.tasks.update_one(
+            {'task_id': task_id, 'status': 'pending'},
+            {'$set': {'status': 'running', 'updated_at': time.time()}},
+        )
+        return res.modified_count == 1
+    except Exception as e:
+        logger.error(f"claim_transfer_task error: {e}")
+        return False
+
+
+async def claim_stale_task_for_resume(task_id: str) -> bool:
+    """
+    Atomically mark a stale 'running'/'retry_pending' task as 'resuming' so
+    no other watchdog tick / actor picks it up at the same time. Returns
+    False if the task's status already changed underneath us.
+    """
+    if db is None: return False
+    try:
+        res = await db.tasks.update_one(
+            {'task_id': task_id, 'status': {'$in': ['running', 'retry_pending']}},
+            {'$set': {'status': 'resuming', 'updated_at': time.time()}},
+        )
+        return res.modified_count == 1
+    except Exception as e:
+        logger.error(f"claim_stale_task_for_resume error: {e}")
+        return False
+
+
+async def get_newer_active_task(user_id: int, created_at: float,
+                                exclude_task_id: str) -> dict | None:
+    """
+    Return a non-terminal task for this user created AFTER `created_at`.
+    A worker that finds one knows IT is the duplicate (an older spawn) and
+    quietly exits instead of fighting the newer dyno over the same TDLib
+    session (AUTH_KEY_DUPLICATED).
+    """
+    if db is None: return None
+    try:
+        return await db.tasks.find_one({
+            'user_id':    user_id,
+            'created_at': {'$gt': created_at},
+            'task_id':    {'$ne': exclude_task_id},
+            'status':     {'$in': ['pending', 'running', 'resuming']},
+        })
+    except Exception as e:
+        logger.error(f"get_newer_active_task error: {e}")
+        return None
+
+
+async def delete_task(task_id: str) -> None:
+    if db is None: return
+    try:
+        await db.tasks.delete_one({'task_id': task_id})
+    except Exception as e:
+        logger.error(f"delete_task error: {e}")
 
 
 async def update_task_status(task_id: str, status: str) -> None:
@@ -696,7 +786,7 @@ async def cancel_all_active_tasks(user_id: int, exclude_task_id: str = None) -> 
     try:
         query = {
             'user_id': user_id,
-            'status': {'$in': ['pending', 'running', 'retry_pending']},
+            'status': {'$in': ['pending', 'running', 'retry_pending', 'resuming']},
         }
         if exclude_task_id:
             query['task_id'] = {'$ne': exclude_task_id}
